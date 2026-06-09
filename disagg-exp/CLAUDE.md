@@ -5,7 +5,6 @@
 > 베이스: `NVIDIA/TensorRT-LLM` fork → `ddps-lab/disaggregation-TensorRT-LLM`, 브랜치 `disagg-exp/trtllm-v1.2.1` (태그 `v1.2.1` 기준).
 
 ## ⚠️ 작업 방침 (반드시 지킬 것)
-- **Claude는 실험 코드를 작성하지 않는다.** 설계·런북·검증·문서만. `launch_trtllm.sh`/YAML/`sweep.py` 수정 등 구현은 **사용자가 직접** 이 fork에서 한다.
 - **공식 코드·방법만 사용** (논문 재현성). 커스텀 해킹 금지. TRT-LLM 공식 `examples/disaggregated/` 패턴을 출발점으로.
 - **모든 런타임(서버 기동/추론/벤치)은 원격 EC2에서 SSH로.** 로컬(Mac)은 파일 편집·git 전용. (aws skill 규칙)
 
@@ -98,7 +97,11 @@ generation_servers:
 - **계승(거의 그대로)**: `sweep.py`(orchestrator :8000 조준), `analyze.py`(COST_PER_HR를 g5/g6/g6e 단가로), `setup.sh`(설치만 TRT-LLM 컨테이너로). ← 원본은 `../vllm-disaggregation/disagg-exp/`.
 - **신규(사용자 작성)**: `launch_trtllm.sh`(config+role별 trtllm-serve+YAML 생성), ctx/gen/disagg YAML, `trtllm_support_matrix.md`.
 - **대체됨**: `launch_configs.sh`→`launch_trtllm.sh`, `disagg_proxy_server.py`→`trtllm-serve disaggregated`, `instrumented_connector.py`→(KV전송시간은 orchestrator 로그/`/metrics`).
-- **문서**: `EXPERIMENT_PLAN.md`(전체 설계·런북), 이 `CLAUDE.md`(단일 진실원).
+- **문서 (4종, 역할 분리)**:
+  - `CLAUDE.md` (이 파일) — 결정·핀·변인통제·스키마 = 단일 진실원/규칙.
+  - `EXPERIMENT_PLAN.md` — 전체 설계·Phase 0~3 런북.
+  - `SETUP_LOG.md` — 한 작업의 시간순 로그 + provenance (나중 정리/methods용).
+  - `LEARNING_NOTES.md` — 개념 중심 공부 노트 (fork/lfs/핀/PD분리/비대칭TP·PP/xPyD/메트릭…). 살아있는 문서.
 
 ## 관련 조사 기록 (글로벌 메모리)
 - `pd-disagg-parallelism-framework-verdict` — 프레임워크 비교(왜 TRT-LLM, vLLM/SGLang 배제).
