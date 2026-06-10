@@ -103,13 +103,18 @@ generation_servers:
 - **신규(Claude 작성, v1.2.1 소스 검증)**: `launch_trtllm.sh`(role별 trtllm-serve + disagg YAML 런타임 생성), `ctx_extra_llm_api_options.yaml`·`gen_extra_llm_api_options.yaml`(워커 변인통제), `disagg_config.yaml`(1P1D 정적 템플릿), `trtllm_support_matrix.md`(Phase0 게이트).
 - **대체됨**: `launch_configs.sh`→`launch_trtllm.sh`, `disagg_proxy_server.py`→`trtllm-serve disaggregated`, `instrumented_connector.py`→(KV전송시간은 orchestrator `/perf_metrics`).
 - **코드 검증**: 적대적 워크플로우로 v1.2.1 소스 대조 → blocker 0. 빈배열 가드(bash<4.4 이식성) 등 minor 픽스 반영. 로컬 정적검사(bash -n / py_compile / yaml) 통과. **런타임 검증은 원격 GPU Phase 0에서.**
-- **문서 (6종, 역할 분리)**:
-  - `CLAUDE.md` (이 파일) — 결정·핀·변인통제·스키마·프레임워크판정 = 단일 진실원/규칙.
-  - `README.md` — **실행 가이드** (어떻게 돌리나 + 파일별 역할 vLLM 대비 + env 레퍼런스 + 트러블슈팅).
-  - `DEBUGGING.md` — **디버그 토글·로그구조·perf/KV전송 읽기·smoke·hang 진단** (측정 전 디버그 OFF 체크).
-  - `EXPERIMENT_PLAN.md` — 전체 설계·Phase 0~3 런북.
-  - `SETUP_LOG.md` — 작업 시간순 로그 + provenance (나중 정리/methods용).
-  - `LEARNING_NOTES.md` — 개념 중심 공부 노트 (fork/lfs/핀/PD분리/비대칭TP·PP/xPyD/메트릭/웜업…). 살아있는 문서.
+- **문서 (8종, 역할 분리 — "한 사실은 한 문서에", 중복 금지)**. 실험 중 무엇을 열지 한눈에:
+
+  | 문서 | 한 줄 역할 | 언제 여나 | 정본 항목(여기서만 풀버전) |
+  |---|---|---|---|
+  | **`CLAUDE.md`** (이 파일) | 결정·핀·**변인통제·dealbreaker·disagg 스키마·프레임워크판정** | 항상(자동로드) | ★ 이 4가지의 **정본**. 다른 문서는 링크만 |
+  | **`README.md`** | **실행 가이드** (컨테이너→smoke→single/inter-node, env표, 트러블슈팅) | 돌릴 때 | 실행 절차·env 레퍼런스 |
+  | **`EXPERIMENT_PLAN.md`** | **무엇을/왜/어떤 순서로** (실험축·Phase 0~3 런북·워크로드 그리드·vLLM→TRT 매핑) | 설계 확인 | Phase 0~3·그리드·매핑표 |
+  | **`DEBUGGING.md`** | 디버그 토글·로그구조·perf/KV전송 읽기·hang(#14020) 진단·측정전 OFF 체크 | 디버깅할 때 | 로그 디렉토리 구조 |
+  | **`LEARNING_NOTES.md`** | 개념 공부 노트(fork/PD분리/TP·PP/메트릭/웜업) — 교과서 수준, 살아있는 문서 | 공부할 때 | 개념 설명 |
+  | **`병렬화-KV전송-측정.md`** | 병렬화×cache_transceiver×**per-side 측정**(prefill/decode RPS·TPS) 심화 조사, 소스레퍼런스 | 측정 설계/조사 | per-side 측정법·KV 백엔드·지원매트릭스 근거 |
+  | **`trtllm_support_matrix.md`** | Phase 0 게이트 **결과표**(어떤 TP·PP 조합이 실제로 도나 — 실측 채움) | Phase 0 실측 | 게이트 실측 결과(산출물) |
+  | **`SETUP_LOG.md`** | 시간순 **작업 로그 + provenance** (어디서 무엇을 했나) | 회고/methods 작성 | 작업 이력 |
 
 ## 프레임워크 선택 근거 + 배경 (구 글로벌 메모리 통합 — 이 문서가 단일 진실원)
 

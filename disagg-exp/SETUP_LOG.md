@@ -1,4 +1,4 @@
-# SETUP_LOG — fork 셋업 작업 로그 (나중에 정리/methods용)
+# SETUP_LOG — 작업 로그 + provenance (나중에 정리/methods용)
 
 > 시간순 행동 + 검증 증거 기록. 결정/규칙은 `CLAUDE.md`, 설계는 `EXPERIMENT_PLAN.md` 참조.
 > 작업 위치: 로컬 Mac(파일·git). 런타임(서버/추론)은 아직 안 함 — 다음 단계(원격 GPU).
@@ -87,8 +87,14 @@ git push -u origin disagg-exp/trtllm-v1.2.1        # push 완료
 - **smoke**: sweep `SWEEP_PD_PAIRS` env(단일포인트). 실제 config + 적은 요청 절차 문서화.
 - **웜업**: `WARMUP_N` 10→20 + 서버/클라 웜업 구분 문서화.
 - **CUDA graph OFF**: gen YAML `cuda_graph_config: null`(사용자 결정, 균일 eager).
-- 문서: CLAUDE(변인통제·파일맵 6종)·README(smoke·산출물·5절)·EXPERIMENT_PLAN·LEARNING_NOTES(F.웜업)·DEBUGGING.md.
+- 문서: CLAUDE(변인통제·파일맵)·README(smoke·산출물·5절)·EXPERIMENT_PLAN·LEARNING_NOTES(F.웜업)·DEBUGGING.md.
 - 정적검사 통과(bash -n/py_compile/yaml/PD파서). **적대적 검증 후 커밋.**
+
+## 2026-06-10 (4) — 문서 정리 (중복제거 + 이름수정, 내용 보존)
+- **이름수정**: `병렬화-커넥터.md` → `병렬화-KV전송-측정.md`. 이유: TRT-LLM엔 vLLM 같은 "커넥터" 개념이 없고 cache_transceiver를 쓰므로 파일명이 내용과 불일치(vLLM 시절 잔재). 본문 H1은 원래 맞았음.
+- **중복제거(정본 일원화)**: 변인통제·dealbreaker·disagg 스키마·프레임워크판정의 **정본 = CLAUDE.md 한 곳**. EXPERIMENT_PLAN의 ②클라/③메트릭/④인프라 재서술과 §리스크는 CLAUDE 포인터로 축약(고유분=Phase 0~3·그리드·vLLM→TRT 매핑표·하드웨어현실 유지). LEARNING_NOTES/DEBUGGING의 dealbreaker는 각자 역할 각도(교육/디버그)만 남김.
+- **파일맵 정정**: CLAUDE.md 파일맵을 6종(stale)→8종 표로 교체 = 정본 문서 인덱스(역할·언제 여나·정본항목). README 파일-역할 표는 코드파일용이라 유지.
+- 산출물·코드 변경 없음(문서만). 문서 8종 유지, 역할 명확화 + 중복 0 목표.
 
 ## 아직 안 한 것 / 주의 (코드에서 확정 못 함 → GPU에서)
 - 로컬에서 TRT-LLM **빌드/실행 안 함** (컨테이너로 원격에서). 코드 정확성은 정적, **동작 검증은 GPU**.

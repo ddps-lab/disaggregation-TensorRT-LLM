@@ -1,11 +1,13 @@
 # 실험 설계: TensorRT-LLM PD Disaggregation — Qwen3-4B, xPyD + 대칭/비대칭 TP·PP (g5/g6/g6e)
 
+> **역할**: *무엇을/왜/어떤 순서로* 측정하나 = 설계·런북. **핀·변인통제값·dealbreaker·disagg 스키마·프레임워크판정의 정본은 `CLAUDE.md`** — 여기선 중복 서술하지 않고 링크한다. 이 문서 고유 = 실험축·Phase 0~3·워크로드 그리드·vLLM→TRT 매핑.
+
 ## Context (왜 / 무엇을)
 
 목표: Prefill/Decode 분리(PD disaggregation)에서 **prefill·decode의 병렬화(TP·PP)를 대칭/비대칭으로 바꿔가며**, 그리고 **xPyD 토폴로지(1P1D → 1P3D → 확장)**로, **inter-node·intra-node** 둘 다에서 성능을 측정한다. 모델은 **Qwen3-4B (dense, GQA, non-MLA)**.
 
 프레임워크 선택 결론 — **TensorRT-LLM (PyTorch 백엔드)**. 근거(선행 조사 검증 완료):
-- PD 분리에서 **임의 비대칭 PP+TP를 parse-time assert 없이 1급 지원하는 유일한 프로덕션 엔진**. vLLM=PD에서 PP 전면 불가(#40674), SGLang=비대칭 PP가 prefill-PP→decode-PP=1로만 제한+대칭 PP도 버그(#15571). 자세한 비교: [[pd-disagg-parallelism-framework-verdict]], [[trtllm-disagg-decision]].
+- PD 분리에서 **임의 비대칭 PP+TP를 parse-time assert 없이 1급 지원하는 유일한 프로덕션 엔진**. vLLM=PD에서 PP 전면 불가(#40674), SGLang=비대칭 PP가 prefill-PP→decode-PP=1로만 제한+대칭 PP도 버그(#15571). 자세한 비교: **`CLAUDE.md` §프레임워크 판정** (구 메모리 통합본).
 - TRT-LLM의 유일한 걸림돌이던 **T4 미지원이 무효화됨**(사용자가 T4 안 써도 됨). 이제 쓸 GPU(g5=A10G SM86, g6=L4 SM89, g6e=L40S SM89)는 **전부 TRT-LLM 호환(최소 SM80 충족)**.
 - PyTorch 백엔드라 **config별 엔진 빌드 불필요**(HF 직접 로드) → TP/PP 스윕에 적합. OpenAI 호환 엔드포인트라 **기존 sweep.py 재사용 가능**.
 
@@ -50,24 +52,11 @@
 | KV 메모리 비율 | `--gpu-memory-utilization 0.85` | `kv_cache_config.free_gpu_memory_fraction: 0.85` |
 | 분산 재현성 | `PYTHONHASHSEED=123` | 동일 + 결정론 샘플링(temp=0) |
 
-### ② 클라이언트측 (`sweep.py` — 그대로 계승, OpenAI 호환이라 수정 최소)
-- **token-id prompt**(`list[int]`)로 `prefill_len` 정확 고정 + `max_tokens=decode_len`·`ignore_eos=true`로 `decode_len` 강제.
-- `temperature=0`, `top_p=1.0`(결정론).
-- `stream=true`+`include_usage`로 **클라이언트에서 TTFT/E2E 직접 측정** — PD 파이프라인 전체(prefill→KV전송→decode)를 서버 메트릭이 못 보므로 필수.
-- **Poisson 도착**(`expovariate(rate)`), 동시연결 무제한.
-- **2-phase**: warmup **20**(disagg UCX 첫 연결·스케줄러 ramp 흡수; 서버 graph/autotuner는 기동 시 자동) → measured **300**(p99 신뢰도). `.done/.failed` resume. **abort/에러율 게이트 제거**(느린·실패 config도 측정에 남김; 분석은 status=success 필터), **클라 요청 타임아웃 없음**(서버 `-r` 1800s 백스톱). **smoke**=실제 config + `SWEEP_PD_PAIRS` 단일포인트 + `SWEEP_WARMUP_N=3`.
-- **perf 수집**: 각 포인트 측정 후 orchestrator `/perf_metrics` 1회 폴링 → `perf_*.json`(KV전송시간 등), analyze가 `kv_p50/p99` 컬럼으로 분석. (disagg YAML `perf_metrics_max_requests` + 워커 `return_perf_metrics:true`. vLLM instrumented_connector 대체.)
-- **디버그**: 측정 런 OFF(`LOG_LEVEL`=info). smoke에서만 `LOG_LEVEL=debug`/`TLLM_LOG_LEVEL`/`UCX_LOG_LEVEL`. CUDA graph는 OFF(균일 eager). → `DEBUGGING.md`.
-- 점검만: `MODEL_NAME`을 Qwen3-4B served-name으로, Qwen3 토크나이저 token-id 경로 호환.
-
-### ③ 메트릭 정의 (`analyze.py` — 그대로 계승)
-- TTFT p50/p99, TPOT=`(e2e−ttft)/(completion−1)` p50/p99.
-- **Throughput 2종**: `thr_e2e=tok/(max(recv)−min(send))`(service window), `thr_send=tok/(max(send)−min(send))`(arrival window), `achieved_rate=N_ok/arrival_window`(saturation 감지).
-- `$/Mtok = cost_hr/(thr_e2e·3600/1e6)` — `COST_PER_HR`를 g5/g6/g6e 단가로 갱신.
-- `prompt_tokens` vs `prefill_len` delta>1 경고(BOS +1 검증).
-
-### ④ 인프라 통제 (`setup.sh` — 계승, inter-node에 특히 중요)
-- 좀비 프로세스 청소(idempotent), **chrony 시계동기**(cross-node 타임스탬프 정렬 — inter-node 1P1D 측정에 필수), 수집기 **nvidia-smi dmon(1Hz)·ifstat(1Hz, NIC=KV전송 바이트 관측)·DCGM**, S3 자동 sync, TP rank-0만 로깅(I/O 경합 방지).
+### ②~④ 클라이언트·메트릭·인프라 통제 → 정본 **`CLAUDE.md` §변인통제**
+중복 서술 대신 정본을 가리킨다. 여기선 이 실험의 **계승 포인트**(무엇을 vLLM에서 그대로 잇나)만:
+- **클라(`sweep.py` 계승)**: token-id prompt로 `prefill_len` 고정 + `ignore_eos`/`max_tokens`로 `decode_len` 강제, `stream`으로 **클라에서 TTFT/E2E 직접 측정**(서버 메트릭은 PD 파이프 전체를 못 봄), Poisson 도착, 2-phase(warmup 20→measured 300), abort게이트·클라 타임아웃 없음, 포인트당 `/perf_metrics` 1회 폴링(KV전송시간). 점검만: Qwen3 토크나이저 token-id 경로 호환. *값·근거 상세=CLAUDE.*
+- **메트릭(`analyze.py` 계승)**: TTFT·TPOT·throughput 2종(service/arrival window)·achieved_rate·$/Mtok. *정의·공식=CLAUDE §목표 / `LEARNING_NOTES.md §E`.*
+- **인프라(`setup.sh` 계승)**: 좀비청소·chrony(inter-node 타임스탬프 정렬 필수)·수집기(nvidia-smi/ifstat=NIC·DCGM)·S3 sync·TP rank-0만 로깅. *상세=CLAUDE.*
 
 ### ⑤ 워크로드 그리드 (계승 + Qwen3-4B/하드웨어 맞춰 조정)
 - **PD_PAIRS**(prefill,decode): `(2048,128)` prefill-heavy · `(1024,512)` balanced · `(128,2048)` decode-heavy — 3종 유지.
@@ -134,7 +123,8 @@
 - 수정(소폭): `disagg-exp/sweep.py`, `analyze.py`, `setup.sh`, `README.md`
 - 대체됨: `launch_configs.sh`, `instrumented_connector.py`, `disagg_proxy_server.py`
 
-## 리스크 / 사용자 상의
-- **ctx-PP→gen-TP hang(#14020)**: 핀 버전에서 재현 시 1.3.0rc로 올림 or 해당 조합 제외 — Phase 0 결과로 결정.
-- **inter-node TCP 성능**: EFA 없으면 KV전송이 TTFT 지배. inter-node는 구조 비교용, 성능 결론은 intra-node 중심.
-- **disagg = EXPERIMENTAL**: 버전·컨테이너 핀 필수(NIXL ABI 커플링).
+## 리스크 / 사용자 상의 (전체 목록·근거 = **`CLAUDE.md` §Dealbreaker**)
+Phase 0 결과로 **결정할 것**만 여기 둔다:
+- **ctx-PP→gen-TP hang(#14020)**: 핀 버전에서 재현 시 → 1.3.0rc 핀 올림 vs 해당 조합 제외 (Phase 0 실측으로 결정).
+- **inter-node TCP**: EFA 없어 KV전송이 TTFT 지배하면 → inter는 구조/correctness 비교용, **성능 결론은 intra-node 중심**.
+- **PP가 광범위하게 막히면** → 축 축소 vs 버전 올림, 사용자와 상의.

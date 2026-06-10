@@ -3,7 +3,8 @@
 > **무엇**: TensorRT-LLM v1.2.1로 Prefill/Decode를 분리(PD disaggregation)해, prefill·decode의 병렬화(TP·PP)를
 > 대칭/비대칭으로, 토폴로지를 xPyD로 바꿔가며 TTFT/TPOT/throughput/$를 측정하는 하네스.
 > **왜 이 폴더**: vLLM에서 시작했으나 PD에서 PP가 안 돼 TRT-LLM으로 이전. 1세대(vLLM) 방법론을 계승.
-> 설계 배경/근거 = `CLAUDE.md`, 개념 = `LEARNING_NOTES.md`, 단계별 런북 = `EXPERIMENT_PLAN.md`.
+> 설계 배경/근거 = `CLAUDE.md`, 개념 = `LEARNING_NOTES.md`, 단계별 런북 = `EXPERIMENT_PLAN.md`, 디버깅 = `DEBUGGING.md`.
+> **전체 문서가 각각 뭐하는지 = `CLAUDE.md` 파일맵 표**(8종 역할·언제 여나 정리).
 
 ---
 
