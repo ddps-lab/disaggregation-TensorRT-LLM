@@ -57,11 +57,24 @@ git push -u origin disagg-exp/trtllm-v1.2.1        # push 완료
 ### 7. 글로벌 메모리 갱신
 - `disagg-exp-experiment-overview.md`: "fork 이전 예정" → "셋업 완료"(repo 경로·브랜치·핀·검증사실).
 
+## 2026-06-10 (2) — 하네스 코드 작성 + 소스 대조 검증 (방침 변경: Claude가 코드 작성)
+
+### 8. 흐름: 소스 분석 → 작성 → 검증
+- **(a) 리서치 워크플로우** (6 병렬 리더 → 빌드스펙): v1.2.1 소스에서 serve CLI·disagg 스키마·LLM args·Qwen3·예제·하네스 이식점을 코드레벨 확정. 핵심: 모델 positional(`--model` 없음), `--pp_size` 존재, `--dtype` CLI 없음, `enable_block_reuse`는 `kv_cache_config` 하위, orchestrator host/port는 disagg YAML에서만, sweep payload(token-id/ignore_eos/min_tokens) 전부 유효.
+- **(b) 작성한 파일 8개** (모두 검증된 사실 기반):
+  - 신규: `launch_trtllm.sh`(role별 trtllm-serve + disagg YAML 런타임 생성, env 파라미터화), `ctx_extra_llm_api_options.yaml`, `gen_extra_llm_api_options.yaml`, `disagg_config.yaml`(1P1D 정적), `trtllm_support_matrix.md`(Phase0 게이트), `README.md`(실행 가이드+vLLM대비 역할).
+  - 이식: `sweep.py`(4곳), `analyze.py`(2곳), `setup.sh`(컨테이너 모델 재작성, 수집기 보존).
+- **(c) 검증 워크플로우** (3 적대적 체커 vs 소스): **blocker 0, major 1, minor 11**(7개는 "정합 확인").
+  - major: `launch_trtllm.sh` 빈배열 확장(`"${role_flag[@]}"`/`${PIDS[@]}`)이 bash<4.4(macOS)서 `unbound variable` → 가드(`[@]+...`/`[*]:-`/count check)로 수정. **로컬 bash 3.2.57서 안 깨짐 실증.**
+  - minor 픽스: build_urls 공백트림, URL 개수 사전검증, CACHE_BACKEND/TP·PP가 URL모드선 inert(문서화), cuda_graph/server_role 주석 정확성.
+- **로컬 정적검사 통과**: `bash -n`(launch/setup), `py_compile`(sweep/analyze), yaml.safe_load(3개).
+
 ## 현재 상태
 - ✅ fork·브랜치(v1.2.1)·핀·문서 = 완료, origin 동기화.
-- ⬜ 실험 코드(`launch_trtllm.sh`, ctx/gen/disagg YAML, `sweep.py`/`analyze.py`/`setup.sh` 이식) = **사용자 작성 예정**.
-- ⬜ 원격 GPU(g6e.12xlarge 등)에서 **Phase 0 스파이크** = 미시작. (어떤 TP/PP 조합 OK인지, ctx-PP→gen-TP hang #14020 실측)
+- ✅ **하네스 코드 8개 작성 + 소스 대조 검증 완료** (blocker 0, 로컬 정적검사 통과).
+- ⬜ 원격 GPU(g6e.12xlarge 등)에서 **Phase 0 스파이크 = 미시작** = 런타임 검증. (어떤 TP/PP 조합 OK인지, ctx-PP→gen-TP hang #14020 실측, max_batch_size/free_gpu_mem OOM 한계, server_role 필요 여부)
 
-## 아직 안 한 것 / 주의
-- 로컬에서 TRT-LLM **빌드/실행 안 함** (컨테이너로 원격에서). LFS 콘텐츠 없음(포인터만).
-- 컨테이너 `nvcr.io/nvidia/tensorrt-llm/release:1.2.1` **실제 pull 검증은 원격 GPU에서** 할 일.
+## 아직 안 한 것 / 주의 (코드에서 확정 못 함 → GPU에서)
+- 로컬에서 TRT-LLM **빌드/실행 안 함** (컨테이너로 원격에서). 코드 정확성은 정적, **동작 검증은 GPU**.
+- 컨테이너 `nvcr.io/nvidia/tensorrt-llm/release:1.2.1` 실제 pull·기동, Qwen3-4B 로드, KV전송 동작, 출력정확성(비분리 비교) = 전부 Phase 0.
+- COST_PER_HR(analyze.py) 단가는 최종 인스턴스/리전 확정 후 채울 것 (현재 placeholder).

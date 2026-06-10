@@ -1,0 +1,28 @@
+# =============================================================================
+# ctx_extra_llm_api_options.yaml — CONTEXT(prefill) 워커 변인통제 (TorchLlmArgs)
+# trtllm-serve <MODEL> --backend pytorch --extra_llm_api_options <이 파일>
+# -----------------------------------------------------------------------------
+# 검증(v1.2.1): yaml.safe_load → update_llm_args_with_extra_dict → TorchLlmArgs
+#   (StrictBaseModel, extra="forbid") → 오타 키는 워커 기동 시 ValidationError.
+# ⚠️ enable_block_reuse / free_gpu_memory_fraction 는 반드시 kv_cache_config 하위!
+#    (top-level에 두면 즉시 ValidationError로 기동 실패.)
+# ⚠️ TP/PP는 여기 두지 말고 CLI --tp_size/--pp_size 로 (중복·충돌 회피).
+# ⚠️ dense Qwen3-4B → moe_config / enable_attention_dp 넣지 말 것 (축 아님).
+# =============================================================================
+
+dtype: bfloat16              # --dtype CLI 없음 → 여기서 지정. g5/g6/g6e(SM>=80) OK
+attn_backend: TRTLLM         # FlashInfer 금지(비대칭 TP 오출력 #6507). 대문자 문자열
+enable_chunked_prefill: false   # prefill 한 번에 = compute-bound 측정 (변인통제)
+disable_overlap_scheduler: true # context 표준(overlap 미지원)
+cuda_graph_config: null      # ctx는 decode graph 불필요 → 메모리 절약 (명시적 null = OFF)
+max_batch_size: 256          # 큐 병목 제거(전 config 동일). max_batch_size <= max_num_tokens 필수
+max_num_tokens: 8192
+
+kv_cache_config:
+  free_gpu_memory_fraction: 0.85   # KV에 할당할 free GPU mem 비율 (전 config 동일)
+  enable_block_reuse: false        # 캐시 오염 차단 + PP hang 회피
+  dtype: auto
+
+cache_transceiver_config:
+  backend: UCX               # DEFAULT|UCX|NIXL|MOONCAKE|MPI 중. gen과 반드시 동일
+  max_tokens_in_buffer: 8192 # >= 최대 ISL 권장 (prefill 2048이면 충분)

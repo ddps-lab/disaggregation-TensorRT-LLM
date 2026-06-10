@@ -1,0 +1,27 @@
+# =============================================================================
+# gen_extra_llm_api_options.yaml — GENERATION(decode) 워커 변인통제 (TorchLlmArgs)
+# trtllm-serve <MODEL> --backend pytorch --extra_llm_api_options <이 파일>
+# -----------------------------------------------------------------------------
+# ctx YAML과 동일 규칙. 차이: overlap scheduler ON, CUDA Graph ON(decode 가속).
+# ⚠️ enable_block_reuse / free_gpu_memory_fraction 는 kv_cache_config 하위!
+# 참고: cuda_graph_config는 batch_sizes 대신 max_batch_size+enable_padding만 사용(둘 다 줄 필요 없음).
+# =============================================================================
+
+dtype: bfloat16
+attn_backend: TRTLLM
+enable_chunked_prefill: false
+disable_overlap_scheduler: false   # decode는 overlap 켜는 게 일반적
+cuda_graph_config:                 # CUDA Graph ON (decode throughput 변인통제)
+  enable_padding: true
+  max_batch_size: 256              # graph 캡처 상한 (batch_sizes는 생략)
+max_batch_size: 256
+max_num_tokens: 8192
+
+kv_cache_config:
+  free_gpu_memory_fraction: 0.85   # ctx와 통일
+  enable_block_reuse: false        # decode-heavy 단발 측정 — 변인통제상 양쪽 false
+  dtype: auto
+
+cache_transceiver_config:
+  backend: UCX                     # ctx와 반드시 동일
+  max_tokens_in_buffer: 8192

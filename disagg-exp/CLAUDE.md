@@ -94,14 +94,16 @@ generation_servers:
 ## 진행 시퀀스 (사용자 명시)
 1. inter-node 1P1D (베이스라인) → 2. 1P3D, decode 병렬화 다양화(대칭→비대칭), inter → 3. intra-node 가정으로 동일 스윕 → 4. D 확장.
 
-## 파일 맵
-- **계승(거의 그대로)**: `sweep.py`(orchestrator :8000 조준), `analyze.py`(COST_PER_HR를 g5/g6/g6e 단가로), `setup.sh`(설치만 TRT-LLM 컨테이너로). ← 원본은 `../vllm-disaggregation/disagg-exp/`.
-- **신규(사용자 작성)**: `launch_trtllm.sh`(config+role별 trtllm-serve+YAML 생성), ctx/gen/disagg YAML, `trtllm_support_matrix.md`.
-- **대체됨**: `launch_configs.sh`→`launch_trtllm.sh`, `disagg_proxy_server.py`→`trtllm-serve disaggregated`, `instrumented_connector.py`→(KV전송시간은 orchestrator 로그/`/metrics`).
-- **문서 (4종, 역할 분리)**:
-  - `CLAUDE.md` (이 파일) — 결정·핀·변인통제·스키마 = 단일 진실원/규칙.
+## 파일 맵 (코드 작성·검증 완료 2026-06-10)
+- **이식(vLLM 계승, 소폭 수정)**: `sweep.py`(MODEL_NAME→Qwen3-4B, metadata에 ctx/gen TP·PP·placement 기록), `analyze.py`(COST_PER_HR g5/g6/g6e, configs T1~T4), `setup.sh`(컨테이너 모델로, 수집기·chrony·DCGM 보존). ← 원본 `../vllm-disaggregation/disagg-exp/`.
+- **신규(Claude 작성, v1.2.1 소스 검증)**: `launch_trtllm.sh`(role별 trtllm-serve + disagg YAML 런타임 생성), `ctx_extra_llm_api_options.yaml`·`gen_extra_llm_api_options.yaml`(워커 변인통제), `disagg_config.yaml`(1P1D 정적 템플릿), `trtllm_support_matrix.md`(Phase0 게이트).
+- **대체됨**: `launch_configs.sh`→`launch_trtllm.sh`, `disagg_proxy_server.py`→`trtllm-serve disaggregated`, `instrumented_connector.py`→(KV전송시간은 orchestrator `/perf_metrics`).
+- **코드 검증**: 적대적 워크플로우로 v1.2.1 소스 대조 → blocker 0. 빈배열 가드(bash<4.4 이식성) 등 minor 픽스 반영. 로컬 정적검사(bash -n / py_compile / yaml) 통과. **런타임 검증은 원격 GPU Phase 0에서.**
+- **문서 (5종, 역할 분리)**:
+  - `CLAUDE.md` (이 파일) — 결정·핀·변인통제·스키마·프레임워크판정 = 단일 진실원/규칙.
+  - `README.md` — **실행 가이드** (어떻게 돌리나 + 파일별 역할 vLLM 대비 + env 레퍼런스 + 트러블슈팅).
   - `EXPERIMENT_PLAN.md` — 전체 설계·Phase 0~3 런북.
-  - `SETUP_LOG.md` — 한 작업의 시간순 로그 + provenance (나중 정리/methods용).
+  - `SETUP_LOG.md` — 작업 시간순 로그 + provenance (나중 정리/methods용).
   - `LEARNING_NOTES.md` — 개념 중심 공부 노트 (fork/lfs/핀/PD분리/비대칭TP·PP/xPyD/메트릭…). 살아있는 문서.
 
 ## 프레임워크 선택 근거 + 배경 (구 글로벌 메모리 통합 — 이 문서가 단일 진실원)
