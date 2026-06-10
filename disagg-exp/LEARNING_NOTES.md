@@ -120,6 +120,13 @@ generation_servers:     # = Decode (D)
 
 ---
 
+## F. 웜업·cold-start (벤치마크 정확성)
+- **두 층위**: (1) **서버측 웜업 = TRT-LLM 자동** — `trtllm-serve` 기동 시 torch.compile + autotuner + CUDA graph 사전캡처(`py_executor.py:276-287`). 우리가 안 함. (2) **클라이언트 2-phase 웜업 = 우리 sweep** — 요청 `WARMUP_N`개 버린 뒤 measured 측정.
+- **왜 클라 웜업이 필요(특히 disagg)**: disagg UCX 연결이 **첫 KV전송 때 lazy 수립**(핸드셰이크 10–200ms, `kv_cache_transceiver.py`) → 서버 웜업이 못 덮음. 스케줄러 ramp도. → 첫 요청들 버려야 cold-start 오염 제거.
+- **WARMUP_N=20**: disagg UCX 흡수용 넉넉히. smoke 땐 3. **`/health` OK ≠ UCX ready** 주의.
+- **autotuner 끄지 말 것**(`enable_autotuner` 기본 on; 끄면 성능 저하, 기동 시 1회만 캐시).
+- 우리 실험은 **CUDA graph OFF**(균일 eager) → graph-capture cold-start 자체가 없음(변인통제).
+
 ## 더 공부할 것 (TODO — 채워가기)
 - [ ] UCX가 TCP 폴백할 때 정확히 어떤 경로(`UCX_TLS`)로 가는지, shm/cuda_copy 차이
 - [ ] TP head 재매핑이 비대칭 TP에서 실제로 어떻게 동작하는지 (cacheFormatter)

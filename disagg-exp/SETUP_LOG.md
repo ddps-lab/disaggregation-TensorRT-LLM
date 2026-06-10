@@ -74,6 +74,22 @@ git push -u origin disagg-exp/trtllm-v1.2.1        # push 완료
 - ✅ **하네스 코드 8개 작성 + 소스 대조 검증 완료** (blocker 0, 로컬 정적검사 통과).
 - ⬜ 원격 GPU(g6e.12xlarge 등)에서 **Phase 0 스파이크 = 미시작** = 런타임 검증. (어떤 TP/PP 조합 OK인지, ctx-PP→gen-TP hang #14020 실측, max_batch_size/free_gpu_mem OOM 한계, server_role 필요 여부)
 
+## 2026-06-10 (3) — 로깅·디버그·웜업 도구 추가 (vLLM 하네스 gap 이식)
+
+### 9. 분석: vLLM 하네스 카탈로그 (5 Explore 에이전트)
+- vLLM disagg-exp 9개 파일 정독 → gap 확정. 이미 이식된 것(수집기·S3·resume·2-phase·analyze 로직)과 빠진 것 분리.
+- **핵심 발견**: TRT-LLM은 vLLM `instrumented_connector.py`(커스텀 KVConnector) 없이도 **네이티브 `/perf_metrics`로 per-request KV전송시간 제공**(더 풍부). 소스 확정: orchestrator `/perf_metrics`=`List[Dict]`(FIFO), `gen_perf_metrics.timing_metrics.kv_cache_transfer_start/end`(초, kv_cache_size>0일 때만). 활성=disagg YAML `perf_metrics_max_requests` + 워커 `return_perf_metrics:true`.
+- **웜업 조사**: 서버측 웜업은 TRT-LLM 자동(graph/autotuner, `py_executor.py:276-287`). 클라 2-phase 웜업은 여전히 필수(disagg UCX 첫 연결 lazy, `kv_cache_transceiver.py`). → WARMUP 10→20.
+
+### 10. 구현 (사용자 결정 반영)
+- **KV계측**: sweep `fetch_perf_metrics()`→`perf_*.json`, analyze `load_perf()`+`kv_p50/p99` 컬럼. ctx/gen YAML `return_perf_metrics:true`, disagg YAML `perf_metrics_max_requests:1000`.
+- **디버그 토글**: launch `LOG_LEVEL`(워커 --log_level/orch -l) + DEBUG 토글 블록(각 env 인라인 주석 "무엇/끄는법"), `DEBUGGING.md` 신규. 측정 OFF 강조(변인통제).
+- **smoke**: sweep `SWEEP_PD_PAIRS` env(단일포인트). 실제 config + 적은 요청 절차 문서화.
+- **웜업**: `WARMUP_N` 10→20 + 서버/클라 웜업 구분 문서화.
+- **CUDA graph OFF**: gen YAML `cuda_graph_config: null`(사용자 결정, 균일 eager).
+- 문서: CLAUDE(변인통제·파일맵 6종)·README(smoke·산출물·5절)·EXPERIMENT_PLAN·LEARNING_NOTES(F.웜업)·DEBUGGING.md.
+- 정적검사 통과(bash -n/py_compile/yaml/PD파서). **적대적 검증 후 커밋.**
+
 ## 아직 안 한 것 / 주의 (코드에서 확정 못 함 → GPU에서)
 - 로컬에서 TRT-LLM **빌드/실행 안 함** (컨테이너로 원격에서). 코드 정확성은 정적, **동작 검증은 GPU**.
 - 컨테이너 `nvcr.io/nvidia/tensorrt-llm/release:1.2.1` 실제 pull·기동, Qwen3-4B 로드, KV전송 동작, 출력정확성(비분리 비교) = 전부 Phase 0.

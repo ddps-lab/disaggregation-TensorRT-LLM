@@ -49,14 +49,28 @@ def _parse_list(env_key: str, default: list[float]) -> list[float]:
         return [float(x) for x in raw.split(",")]
     return default
 
-PD_PAIRS = [
+# PD_PAIRS: (prefill_len, decode_len) 조합. SWEEP_PD_PAIRS env로 override (smoke용 단일 포인트 등).
+#   형식: "2048,128;1024,512" (쌍은 ';', 쌍 안 두 수는 ','). 미설정 시 기본 3종.
+def _parse_pd_pairs(env_key: str, default: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    raw = os.environ.get(env_key, "")
+    if not raw:
+        return default
+    out: list[tuple[int, int]] = []
+    for chunk in raw.split(";"):
+        p, d = chunk.split(",")
+        out.append((int(p), int(d)))
+    return out
+
+PD_PAIRS = _parse_pd_pairs("SWEEP_PD_PAIRS", [
     (2048, 128),
     (1024, 512),
     (128, 2048),
-]
+])
 RATES        = _parse_list("SWEEP_RATES", [1.0, 2.0, 4.0])  # 초당 요청 수 (QPS)
 
-WARMUP_N   = int(os.environ.get("SWEEP_WARMUP_N",   "10"))   # 준비운동 요청 수
+# warmup(버림): disagg는 첫 KV전송에서 UCX 연결이 lazy 수립되므로 넉넉히 20. (서버측 CUDA graph/autotuner는
+#   trtllm-serve 기동 시 자동 웜업 → 클라 웜업은 UCX·스케줄러 ramp 흡수용.) smoke 땐 SWEEP_WARMUP_N=3.
+WARMUP_N   = int(os.environ.get("SWEEP_WARMUP_N",   "20"))   # 준비운동 요청 수
 MEASURED_N = int(os.environ.get("SWEEP_MEASURED_N", "300"))  # 실전 측정 요청 수
 
 # 웜업 단계에서 서버가 감당 못하면 실전을 스킵하는 기준
@@ -368,6 +382,42 @@ async def wait_for_health(base_url: str, timeout_s: int = 300) -> None:
     raise RuntimeError(f"Server at {base_url} not healthy after {timeout_s}s")
 
 
+# ── perf metrics 수집 (KV전송시간 등) ──────────────────────────────────────────
+# 포인트 측정 종료 후 orchestrator /perf_metrics를 1회 폴링해 원본 저장.
+#   - 응답: List[Dict] (FIFO, 요청 ID 없음). KV전송시간 = gen_perf_metrics[.perf_metrics].timing_metrics의
+#     kv_cache_transfer_end-start(초, kv_cache_size>0일 때만). analyze.py가 None-safe 파싱(perf_metrics 래퍼 유무 둘 다).
+#   - 활성: disagg YAML perf_metrics_max_requests>0 + 워커 extra YAML return_perf_metrics:true.
+#   - 비활성/엔드포인트 없음이면 조용히 skip — 측정엔 영향 없음(변인통제: 측정 후 1회만 폴링).
+async def fetch_perf_metrics(base_url: str, out_path: Path) -> None:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{base_url}/perf_metrics",
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    print(f"  [perf] /perf_metrics HTTP {resp.status} — skip", flush=True)
+                    return
+                data = await resp.json()
+    except Exception as exc:
+        print(f"  [perf] fetch skip: {exc}", flush=True)
+        return
+    try:
+        with open(out_path, "w") as f:
+            json.dump(data, f)
+        recs = data if isinstance(data, list) else []
+
+        def _has_kv(e: dict) -> bool:
+            gen = (e.get("gen_perf_metrics") or {}) if isinstance(e, dict) else {}
+            gen = gen.get("perf_metrics") or gen   # perf_metrics 래퍼 있으면 벗김(둘 다 대응)
+            return (gen.get("timing_metrics") or {}).get("kv_cache_transfer_start") is not None
+
+        n_kv = sum(1 for e in recs if _has_kv(e))
+        print(f"  [perf] {len(recs)} records ({n_kv} w/ KV transfer) → {out_path.name}", flush=True)
+    except Exception as exc:
+        print(f"  [perf] save failed: {exc}", flush=True)
+
+
 # ── main (전체 실험 오케스트레이터) ────────────────────────────────────────────
 # 실행 순서: 영수증 생성 → S3 백업 시작 → 서버 대기 → Grid 조건표 생성 → 순차 실행
 async def main(args: argparse.Namespace) -> None:
@@ -453,6 +503,8 @@ async def main(args: argparse.Namespace) -> None:
         if ok:
             marker_done.touch()
             marker_failed.unlink(missing_ok=True)
+            # KV전송시간 등 per-request perf 수집 (측정 종료 후 1회). 비활성이면 조용히 skip.
+            await fetch_perf_metrics(base_url, out_dir / f"perf_{point_id}.json")
         else:
             marker_failed.touch()
 

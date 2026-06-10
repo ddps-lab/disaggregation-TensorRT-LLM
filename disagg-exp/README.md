@@ -41,6 +41,18 @@ docker run --rm -it --gpus all --network host --ipc host --shm-size=8g \
 bash setup.sh          # tensorrt_llm 1.2.1 확인 + 수집기·deps 설치
 ```
 
+### 0) smoke — 본 스윕 전 빠른 검증 (디버깅용, 실제 config + 적은 요청)
+"길게 켜놓고 에러나면 비싸다" → 같은 launch로 띄우고 요청만 적게 5분 검증 후 본 스윕.
+```bash
+# 서버(디버그 로그 ON): 실제 쓸 config 그대로
+LABEL=smoke NUM_CTX=1 NUM_GEN=1 CTX_TP=1 CTX_PP=1 GEN_TP=1 GEN_PP=1 LOG_LEVEL=debug bash launch_trtllm.sh all
+# 스윕(단일 포인트, warmup 3 / measured 5):
+SWEEP_PD_PAIRS="1024,512" SWEEP_RATES=1.0 SWEEP_WARMUP_N=3 SWEEP_MEASURED_N=5 \
+  python sweep.py --config smoke --base-url http://localhost:8000 --s3-bucket ""
+python analyze.py --configs smoke      # status:success + kv_p50ms 컬럼에 값 → 통과
+# 통과하면 LOG_LEVEL 빼고(=info) 아래 본 스윕. (디버그 토글 상세 → DEBUGGING.md)
+```
+
 ### A) 단일 노드 (Phase 0 스파이크 — 권장 시작점, g6e.12xlarge=4×L40S)
 **셸 1 — 서버 기동** (ctx+gen+orchestrator 한 번에):
 ```bash
@@ -97,6 +109,10 @@ bash launch_trtllm.sh proxy
 | `CTX_URLS` / `GEN_URLS` | (localhost 자동) | inter-node 워커 host:port 목록 (개수==NUM_CTX/GEN) |
 | `EXP_LOG_DIR` | `./results` | 결과·생성 YAML·로그 경로 |
 | `USE_SERVER_ROLE` | `0` | 1이면 `--server_role CONTEXT/GENERATION` 추가 (Phase 0서 필요 판명 시) |
+| `LOG_LEVEL` | `info` | 서버 로그레벨(워커 `--log_level`/orchestrator `-l`). **측정=info, 디버그=debug** (→ DEBUGGING.md) |
+| `PERF_METRICS_MAX_REQUESTS` | `1000` | orchestrator perf 버퍼(KV전송시간 `/perf_metrics`). 0=off |
+
+**sweep.py env**: `SWEEP_PD_PAIRS`("2048,128;1024,512", smoke용 단일포인트) · `SWEEP_RATES` · `SWEEP_WARMUP_N`(기본 20, smoke 3) · `SWEEP_MEASURED_N`(300) · `PLACEMENT`(intra|inter, metadata용).
 
 ---
 
@@ -107,3 +123,17 @@ bash launch_trtllm.sh proxy
 - **proxy `/metrics` 404**: orchestrator엔 `/metrics` 없음 → 워커(:8001 등) `/metrics` 또는 proxy `/perf_metrics` 사용.
 - **요청이 EOS에서 조기 종료**: `ignore_eos`+`max_tokens`로 길이 강제 (v1.2.1 지원 확인). 필요시 payload에 `min_tokens` 추가.
 - **hang (무응답 300s+)**: ctx-PP→gen-TP 조합(#14020) 의심 → `trtllm_support_matrix.md`에 FAIL 기록, 조합 제외 or 1.3.0rc 검토.
+
+---
+
+## 5. 산출물 & 디버깅
+**측정 산출물** (`$EXP_LOG_DIR/<config>/`):
+- `p{..}.jsonl` — 요청별 TTFT/E2E/status (sweep)
+- `perf_p{..}.json` — `/perf_metrics` 스냅샷(KV전송시간·블록재사용) ★
+- `metadata.json` — ctx/gen TP·PP·xPyD·placement·cache_backend
+- 시스템: `nvidia_smi.csv`·`ifstat.csv`·`dcgm.log` (1Hz/2s), `s3_sync.log`, `clock_baseline_*`
+
+**분석**: `analyze.py --plot` → TTFT/TPOT/throughput(2종)/$Mtok **+ `kv_p50ms`/`kv_p99ms`(KV전송시간)** 표·플롯.
+
+**디버깅 / 로그구조 / KV·perf 읽는 법 / hang 진단 / 디버그 토글 켜고 끄기 → `DEBUGGING.md`.**
+> ⚠️ 측정 런에선 디버그 로그 OFF(`LOG_LEVEL` 미설정). 디버그 로그 = I/O 노이즈 → 변인 오염.

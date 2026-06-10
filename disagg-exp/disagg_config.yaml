@@ -26,6 +26,8 @@ port: 8000                 # sweep.py 조준 포트. 절대 8000
 model: Qwen/Qwen3-4B       # ctx/gen에 상속 (get_llm_args positional model)
 backend: pytorch
 max_retries: 1
+perf_metrics_max_requests: 1000   # orchestrator perf 버퍼 — /perf_metrics로 KV전송시간 노출. 0=off
+#   (워커 ctx/gen extra YAML의 return_perf_metrics: true 와 짝)
 
 # ===== context (prefill) 풀 =====
 context_servers:

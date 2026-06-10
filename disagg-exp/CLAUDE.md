@@ -45,16 +45,19 @@
 | prefill 한 번에(compute-bound) | context 서버 `enable_chunked_prefill: false` |
 | dtype 통일 | `--dtype bfloat16` (전 config 동일) |
 | 큐 병목 제거 | `max_batch_size` / `max_num_tokens` 상향, 전 config 동일 |
-| CUDA Graph | decode `cuda_graph_config` ON |
+| CUDA Graph | **OFF** — 양쪽 `cuda_graph_config: null` (사용자 결정 2026-06: 균일 eager → 변인통제 + graph-capture cold-start 제거) |
 | KV 메모리 비율 | `kv_cache_config.free_gpu_memory_fraction: 0.85` (전 config 동일) |
 | 결정론 | temp=0, top_p=1, `PYTHONHASHSEED` 고정 |
 | 스케줄러 | context 서버 `disable_overlap_scheduler: True` (disagg 표준) |
+| 디버그 로그 | 측정 런 **OFF**(info). 디버그는 smoke에서만(`LOG_LEVEL`/`TLLM_LOG_LEVEL`/`UCX_LOG_LEVEL`). → `DEBUGGING.md` |
+| perf 수집 | disagg YAML `perf_metrics_max_requests:1000` + 워커 `return_perf_metrics:true` → `/perf_metrics`, 측정 후 1회 폴링(저오버헤드, ON 유지) |
+| autotuner | `enable_autotuner` 기본 ON 유지(끄면 성능 저하). 서버 graph/autotuner는 기동 시 자동 웜업 |
 
 ### 클라이언트측 (`sweep.py` 계승, OpenAI 호환이라 수정 최소)
 - token-id prompt(list[int])로 `prefill_len` 고정 + `max_tokens=decode_len`·`ignore_eos=true`로 `decode_len` 강제.
 - `stream=true`로 **클라이언트에서 TTFT/E2E 직접 측정** (서버 메트릭은 prefill→전송→decode 전체를 못 봄).
 - Poisson 도착, 동시연결 무제한.
-- **2-phase**: warmup(10~50) → 건강검진(`fail_rate>0.30` or `ttft_p99>300s` → measured 스킵+`.failed`) → measured **300**(p99 신뢰).
+- **2-phase**: warmup **20**(disagg는 첫 KV전송에서 UCX 연결 lazy 수립 → 넉넉히; 서버측 graph/autotuner는 기동 시 자동 웜업) → 건강검진(`fail_rate>0.30` or `ttft_p99>300s` → measured 스킵+`.failed`) → measured **300**(p99 신뢰). smoke 땐 `SWEEP_WARMUP_N=3`. `/health` OK ≠ UCX ready 주의.
 
 ### 인프라 (`setup.sh` 계승)
 - 좀비 청소(idempotent), **chrony 시계동기**(inter-node 필수), 수집기 nvidia-smi dmon(1Hz)·ifstat(1Hz, NIC=KV전송 관측)·DCGM, S3 자동 sync, TP rank-0만 로깅.
@@ -95,16 +98,18 @@ generation_servers:
 1. inter-node 1P1D (베이스라인) → 2. 1P3D, decode 병렬화 다양화(대칭→비대칭), inter → 3. intra-node 가정으로 동일 스윕 → 4. D 확장.
 
 ## 파일 맵 (코드 작성·검증 완료 2026-06-10)
-- **이식(vLLM 계승, 소폭 수정)**: `sweep.py`(MODEL_NAME→Qwen3-4B, metadata에 ctx/gen TP·PP·placement 기록), `analyze.py`(COST_PER_HR g5/g6/g6e, configs T1~T4), `setup.sh`(컨테이너 모델로, 수집기·chrony·DCGM 보존). ← 원본 `../vllm-disaggregation/disagg-exp/`.
+- **이식(vLLM 계승, 소폭 수정)**: `sweep.py`(MODEL_NAME→Qwen3-4B, metadata 토폴로지, **+perf_metrics 폴링·SWEEP_PD_PAIRS·WARMUP 20**), `analyze.py`(COST_PER_HR g5/g6/g6e, T1~T4, **+KV전송시간 분석**), `setup.sh`(컨테이너 모델, 수집기 보존). ← 원본 `../vllm-disaggregation/disagg-exp/`.
+- **도구 추가(2026-06-10, 소스 검증)**: KV전송 계측(`/perf_metrics`→`perf_*.json`→analyze KV컬럼), 디버그 토글(`launch_trtllm.sh` `LOG_LEVEL`+env 인라인주석, `DEBUGGING.md`), smoke(`SWEEP_PD_PAIRS`+적은요청), 웜업(20, 서버/클라 구분), **CUDA graph OFF**. vLLM의 `instrumented_connector.py`는 TRT-LLM 네이티브 `/perf_metrics`로 대체(더 풍부).
 - **신규(Claude 작성, v1.2.1 소스 검증)**: `launch_trtllm.sh`(role별 trtllm-serve + disagg YAML 런타임 생성), `ctx_extra_llm_api_options.yaml`·`gen_extra_llm_api_options.yaml`(워커 변인통제), `disagg_config.yaml`(1P1D 정적 템플릿), `trtllm_support_matrix.md`(Phase0 게이트).
 - **대체됨**: `launch_configs.sh`→`launch_trtllm.sh`, `disagg_proxy_server.py`→`trtllm-serve disaggregated`, `instrumented_connector.py`→(KV전송시간은 orchestrator `/perf_metrics`).
 - **코드 검증**: 적대적 워크플로우로 v1.2.1 소스 대조 → blocker 0. 빈배열 가드(bash<4.4 이식성) 등 minor 픽스 반영. 로컬 정적검사(bash -n / py_compile / yaml) 통과. **런타임 검증은 원격 GPU Phase 0에서.**
-- **문서 (5종, 역할 분리)**:
+- **문서 (6종, 역할 분리)**:
   - `CLAUDE.md` (이 파일) — 결정·핀·변인통제·스키마·프레임워크판정 = 단일 진실원/규칙.
   - `README.md` — **실행 가이드** (어떻게 돌리나 + 파일별 역할 vLLM 대비 + env 레퍼런스 + 트러블슈팅).
+  - `DEBUGGING.md` — **디버그 토글·로그구조·perf/KV전송 읽기·smoke·hang 진단** (측정 전 디버그 OFF 체크).
   - `EXPERIMENT_PLAN.md` — 전체 설계·Phase 0~3 런북.
   - `SETUP_LOG.md` — 작업 시간순 로그 + provenance (나중 정리/methods용).
-  - `LEARNING_NOTES.md` — 개념 중심 공부 노트 (fork/lfs/핀/PD분리/비대칭TP·PP/xPyD/메트릭…). 살아있는 문서.
+  - `LEARNING_NOTES.md` — 개념 중심 공부 노트 (fork/lfs/핀/PD분리/비대칭TP·PP/xPyD/메트릭/웜업…). 살아있는 문서.
 
 ## 프레임워크 선택 근거 + 배경 (구 글로벌 메모리 통합 — 이 문서가 단일 진실원)
 

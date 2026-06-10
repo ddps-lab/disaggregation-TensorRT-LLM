@@ -18,6 +18,10 @@ cuda_graph_config: null      # ctx는 decode graph 불필요 → 메모리 절�
 max_batch_size: 256          # 큐 병목 제거(전 config 동일). max_batch_size <= max_num_tokens 필수
 max_num_tokens: 8192
 
+# per-request perf 메트릭(KV전송시간 등) 수집 → orchestrator /perf_metrics로 노출 (analyze가 사용)
+return_perf_metrics: true
+perf_metrics_max_requests: 1000    # 워커 perf 버퍼 (>= 측정 N). 0이면 비활성
+
 kv_cache_config:
   free_gpu_memory_fraction: 0.85   # KV에 할당할 free GPU mem 비율 (전 config 동일)
   enable_block_reuse: false        # 캐시 오염 차단 + PP hang 회피

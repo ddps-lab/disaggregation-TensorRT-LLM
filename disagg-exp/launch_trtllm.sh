@@ -34,6 +34,18 @@ export PYTHONHASHSEED="${PYTHONHASHSEED:-123}"
 # Ethernet(EFA 없음) 노드용. NVLink 없는 g5/g6/g6e PCIe intra-node에도 안전.
 export UCX_TLS="${UCX_TLS:-tcp,cuda_copy,sm,self}"
 
+# ---------- 로그레벨 / perf 메트릭 ----------
+LOG_LEVEL="${LOG_LEVEL:-info}"            # 서버 로그레벨. 측정=info. 디버그=debug|verbose|trace. (워커 --log_level / orchestrator -l)
+PERF_METRICS_MAX_REQUESTS="${PERF_METRICS_MAX_REQUESTS:-1000}"  # per-request perf(KV전송시간 등) 버퍼 크기. >=측정 N 권장. 0=비활성
+
+# ===== DEBUG 토글 (기본 OFF) — ⚠️ 측정 런에선 OFF로 둘 것 (디버그 로그 = I/O 노이즈 → 변인 오염) =====
+#   켜는 법: 아래 줄의 주석(#) 제거. 끄는 법: 다시 주석 처리. 각 줄 끝 = [이게 무슨 디버그인가].
+#   (export된 env는 워커/orchestrator 자식 프로세스에 자동 상속됨.)
+# export TLLM_LOG_LEVEL=debug                       # TRT-LLM 파이썬 상세 로그 (debug|verbose|trace)
+# export UCX_LOG_LEVEL=debug                        # UCX(KV전송 전송계층) 상세 로그 — KV전송 디버깅용
+# export TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 # KV전송 overlap 비활성(타이밍 단순화) — KV전송 디버깅용
+# ==============================================================================================
+
 # ---------- 토폴로지 (config마다 바꾸는 독립변수) ----------
 NUM_CTX="${NUM_CTX:-1}"                   # context 인스턴스 수 (xPyD의 P)
 NUM_GEN="${NUM_GEN:-1}"                   # generation 인스턴스 수 (xPyD의 D; 1P3D면 3)
@@ -100,6 +112,7 @@ launch_worker() {
   CUDA_VISIBLE_DEVICES="$gpus" \
   trtllm-serve "$MODEL" \
     --backend "$BACKEND" \
+    --log_level "$LOG_LEVEL" \
     --tp_size "$tp" \
     --pp_size "$pp" \
     --host 0.0.0.0 \
@@ -137,6 +150,7 @@ write_disagg_yaml() {
     echo "model: $MODEL               # ctx/gen에 상속 (get_llm_args positional model)"
     echo "backend: $BACKEND"
     echo "max_retries: 1"
+    echo "perf_metrics_max_requests: $PERF_METRICS_MAX_REQUESTS   # orchestrator perf 버퍼(KV전송시간 /perf_metrics 노출). 0=off"
     echo "context_servers:"
     echo "  num_instances: $NUM_CTX"
     echo "  tensor_parallel_size: $CTX_TP"
@@ -192,6 +206,7 @@ start_proxy() {
     -c "$cfg" \
     -t "$SERVER_START_TIMEOUT" \
     -r "$REQUEST_TIMEOUT" \
+    -l "$LOG_LEVEL" \
     2>&1 | tee "$LOG_DIR/trtllm_${LABEL}_proxy_$(hostname).log"
 }
 

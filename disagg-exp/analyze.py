@@ -131,6 +131,42 @@ def analyze_point(rows: list[dict]) -> dict:
     }
 
 
+def load_perf(config_dir: Path, point_id: str) -> dict:
+    """perf_{point_id}.json (orchestrator /perf_metrics 스냅샷)에서 KV전송시간·블록재사용 통계 추출.
+    파일 없으면(=perf 비활성) 빈 dict → 표에 'n/a'. gen kv_cache_transfer_*는 kv_cache_size>0일 때만 존재."""
+    pf = config_dir / f"perf_{point_id}.json"
+    if not pf.exists():
+        return {}
+    try:
+        data = json.loads(pf.read_text())
+    except Exception:
+        return {}
+    if not isinstance(data, list):   # 비활성/에러 응답(dict/null 등)이면 안전 skip (analyze 전체 크래시 방지)
+        return {}
+    kv_ms: list[float] = []
+    reused = missed = 0
+    for e in data:
+        if not isinstance(e, dict):
+            continue
+        gen = e.get("gen_perf_metrics") or {}
+        # 워커 per-request dict는 timing_metrics를 'perf_metrics' 래퍼 아래 중첩할 수 있음(버전차) → 둘 다 대응
+        gen = gen.get("perf_metrics") or gen
+        tm = gen.get("timing_metrics") or {}
+        st, en = tm.get("kv_cache_transfer_start"), tm.get("kv_cache_transfer_end")
+        if st is not None and en is not None:
+            kv_ms.append((en - st) * 1000.0)
+        km = gen.get("kv_cache_metrics") or {}
+        reused += km.get("num_reused_blocks", 0)
+        missed += km.get("num_missed_blocks", 0)
+    out: dict = {"n_kv": len(kv_ms)}
+    if kv_ms:
+        out["kv_transfer_p50_ms"] = _p(kv_ms, 50)
+        out["kv_transfer_p99_ms"] = _p(kv_ms, 99)
+    if reused + missed:
+        out["block_reuse_ratio"] = reused / (reused + missed)
+    return out
+
+
 def dollar_per_m_tokens(stats: dict, config: str) -> float:
     """$/M output tokens using e2e throughput and on-demand price."""
     thr = stats.get("thr_tok_s_e2e", 0)
@@ -147,7 +183,7 @@ def print_table(all_stats: dict[str, dict[str, dict]]) -> None:
         f"{'config':<8} {'point':<32} {'n_ok':>6} {'fail%':>6}"
         f" {'ttft_p50ms':>11} {'ttft_p99ms':>11}"
         f" {'tpot_p50ms':>11} {'tpot_p99ms':>11}"
-        f" {'thr_e2e':>9} {'$/Mtok':>8}"
+        f" {'thr_e2e':>9} {'$/Mtok':>8} {'kv_p50ms':>9} {'kv_p99ms':>9}"
     )
     print(header)
     print("-" * len(header))
@@ -159,11 +195,15 @@ def print_table(all_stats: dict[str, dict[str, dict]]) -> None:
                 print(f"{config:<8} {point_id:<32} {'NO DATA':>6}")
                 continue
             dpm = dollar_per_m_tokens(s, config)
+            kv50 = s.get("kv_transfer_p50_ms")
+            kv99 = s.get("kv_transfer_p99_ms")
+            kv50s = f"{kv50:>9.2f}" if kv50 is not None else f"{'n/a':>9}"
+            kv99s = f"{kv99:>9.2f}" if kv99 is not None else f"{'n/a':>9}"
             print(
                 f"{config:<8} {point_id:<32} {s['n_ok']:>6} {s['fail_rate']*100:>5.1f}%"
                 f" {s['ttft_p50_ms']:>11.1f} {s['ttft_p99_ms']:>11.1f}"
                 f" {s['tpot_p50_ms']:>11.1f} {s['tpot_p99_ms']:>11.1f}"
-                f" {s['thr_tok_s_e2e']:>9.1f} {dpm:>8.3f}"
+                f" {s['thr_tok_s_e2e']:>9.1f} {dpm:>8.3f} {kv50s} {kv99s}"
             )
 
 
@@ -243,7 +283,9 @@ def main(args: argparse.Namespace) -> None:
         all_stats[config] = {}
         for point_id, rows in sorted(points.items()):
             _warn_pt_delta(rows, point_id)
-            all_stats[config][point_id] = analyze_point(rows)
+            s = analyze_point(rows)
+            s.update(load_perf(log_dir / config, point_id))   # KV전송시간 등 perf 병합(있으면)
+            all_stats[config][point_id] = s
 
     if not all_stats:
         print("No data found.", file=sys.stderr)
