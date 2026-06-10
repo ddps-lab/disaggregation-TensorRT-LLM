@@ -55,7 +55,7 @@
 - `temperature=0`, `top_p=1.0`(결정론).
 - `stream=true`+`include_usage`로 **클라이언트에서 TTFT/E2E 직접 측정** — PD 파이프라인 전체(prefill→KV전송→decode)를 서버 메트릭이 못 보므로 필수.
 - **Poisson 도착**(`expovariate(rate)`), 동시연결 무제한.
-- **2-phase**: warmup **20**(disagg UCX 첫 연결·스케줄러 ramp 흡수; 서버 graph/autotuner는 기동 시 자동 웜업) → 건강검진(`fail_rate>0.30` or `ttft_p99>300s` → measured 스킵 + `.failed` 마커) → measured **300**(p99 신뢰도). `.done/.failed` resume. **smoke**=실제 config + `SWEEP_PD_PAIRS` 단일포인트 + `SWEEP_WARMUP_N=3`.
+- **2-phase**: warmup **20**(disagg UCX 첫 연결·스케줄러 ramp 흡수; 서버 graph/autotuner는 기동 시 자동) → measured **300**(p99 신뢰도). `.done/.failed` resume. **abort/에러율 게이트 제거**(느린·실패 config도 측정에 남김; 분석은 status=success 필터), **클라 요청 타임아웃 없음**(서버 `-r` 1800s 백스톱). **smoke**=실제 config + `SWEEP_PD_PAIRS` 단일포인트 + `SWEEP_WARMUP_N=3`.
 - **perf 수집**: 각 포인트 측정 후 orchestrator `/perf_metrics` 1회 폴링 → `perf_*.json`(KV전송시간 등), analyze가 `kv_p50/p99` 컬럼으로 분석. (disagg YAML `perf_metrics_max_requests` + 워커 `return_perf_metrics:true`. vLLM instrumented_connector 대체.)
 - **디버그**: 측정 런 OFF(`LOG_LEVEL`=info). smoke에서만 `LOG_LEVEL=debug`/`TLLM_LOG_LEVEL`/`UCX_LOG_LEVEL`. CUDA graph는 OFF(균일 eager). → `DEBUGGING.md`.
 - 점검만: `MODEL_NAME`을 Qwen3-4B served-name으로, Qwen3 토크나이저 token-id 경로 호환.

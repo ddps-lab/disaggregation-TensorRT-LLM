@@ -57,7 +57,7 @@
 - token-id prompt(list[int])로 `prefill_len` 고정 + `max_tokens=decode_len`·`ignore_eos=true`로 `decode_len` 강제.
 - `stream=true`로 **클라이언트에서 TTFT/E2E 직접 측정** (서버 메트릭은 prefill→전송→decode 전체를 못 봄).
 - Poisson 도착, 동시연결 무제한.
-- **2-phase**: warmup **20**(disagg는 첫 KV전송에서 UCX 연결 lazy 수립 → 넉넉히; 서버측 graph/autotuner는 기동 시 자동 웜업) → 건강검진(`fail_rate>0.30` or `ttft_p99>300s` → measured 스킵+`.failed`) → measured **300**(p99 신뢰). smoke 땐 `SWEEP_WARMUP_N=3`. `/health` OK ≠ UCX ready 주의.
+- **2-phase**: warmup **20**(disagg UCX 첫 연결·스케줄러 ramp 흡수; 서버측 graph/autotuner는 기동 시 자동) → measured **300**(p99 신뢰). **abort/에러율 게이트 제거**(느리거나 실패하는 config도 측정에 남김 — 분석은 status=success 필터). **클라 요청 타임아웃 없음**(서버 `-r` 1800s가 백스톱). smoke 땐 `SWEEP_WARMUP_N=3`. `/health` OK ≠ UCX ready 주의.
 
 ### 인프라 (`setup.sh` 계승)
 - 좀비 청소(idempotent), **chrony 시계동기**(inter-node 필수), 수집기 nvidia-smi dmon(1Hz)·ifstat(1Hz, NIC=KV전송 관측)·DCGM, S3 자동 sync, TP rank-0만 로깅.

@@ -73,10 +73,6 @@ RATES        = _parse_list("SWEEP_RATES", [1.0, 2.0, 4.0])  # 초당 요청 수 
 WARMUP_N   = int(os.environ.get("SWEEP_WARMUP_N",   "20"))   # 준비운동 요청 수
 MEASURED_N = int(os.environ.get("SWEEP_MEASURED_N", "300"))  # 실전 측정 요청 수
 
-# 웜업 단계에서 서버가 감당 못하면 실전을 스킵하는 기준
-ABORT_FAIL_RATE  = float(os.environ.get("SWEEP_ABORT_FAIL_RATE",  "0.30"))  # 에러율 30% 초과 시
-ABORT_TTFT_P99_S = float(os.environ.get("SWEEP_ABORT_TTFT_P99_S", "300.0"))  # TTFT p99가 5분 초과 시
-
 LOG_DIR = os.environ.get("EXP_LOG_DIR", "./results")  # 모든 결과 파일의 저장 경로
 
 MODEL_NAME = "Qwen/Qwen3-4B"  # TRT-LLM은 model을 검증 안 하지만(positional, --served-model-name 없음),
@@ -102,10 +98,10 @@ class Result:
 
 
 # ── 클라이언트 초시계 (API 요청 1개의 TTFT/E2E 측정) ────────────────────────
-# vLLM 내부 메트릭은 PD 분리 시 전체 파이프라인(Prefill→KV전송→Decode)을 모르므로,
-# 여기서(클라이언트) SSE 스트리밍으로 직접 측정합니다.
-# 원리: stream=True로 요청하면 서버가 토큰을 하나 생성할 때마다 한 줄씩 보내줌.
-#       → "첫 줄 도착 시점" = TTFT, "마지막 줄 도착 시점" = E2E
+# 클라이언트에서 SSE로 직접 측정 = 사용자 체감 지연(client→orchestrator 네트워크 포함), 프레임워크 무관·견고.
+#   (TRT-LLM orchestrator /perf_metrics도 disagg 전체 파이프라인 TTFT·KV전송시간을 제공 → analyze가 보완 사용.
+#    단 클라 측정을 1차로 유지: perf 활성 여부에 의존 안 하고, 실제 체감 지연을 잼.)
+# 원리: stream=True면 토큰 생성마다 한 줄씩 옴 → 첫 줄 도착=TTFT, 마지막 줄=E2E.
 async def _do_request(
     session: aiohttp.ClientSession,
     base_url: str,
@@ -138,11 +134,12 @@ async def _do_request(
 
     try:
         # ② 서버에 HTTP POST 요청 전송 (스트리밍 연결 열기)
-        # 타임아웃: 300초(5분) 안에 전체 응답이 완료되지 않으면 timeout 처리
+        # 클라 타임아웃 없음(total=None) — 느린/막힌 요청을 인위로 자르지 않고 끝까지 잰다.
+        #   백스톱: orchestrator -r REQUEST_TIMEOUT(기본 1800s)가 서버측에서 바운드.
         async with session.post(
             f"{base_url}/v1/completions",
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=300),
+            timeout=aiohttp.ClientTimeout(total=None),
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
@@ -203,7 +200,7 @@ async def run_point(
     rate: float,
     out_path: Path,
 ) -> bool:
-    """Returns True if measured phase was completed (not aborted)."""
+    """항상 warmup → measured 실행 후 JSONL 저장. 항상 True 반환 (abort 게이트 제거)."""
 
     # limit=0: 동시 연결 수 제한 없음 (수백 개 요청이 동시에 날아감)
     connector = aiohttp.TCPConnector(limit=0)
@@ -227,37 +224,22 @@ async def run_point(
                 results.append(await t)  # 모든 요청이 끝날 때까지 대기
             return results
 
-        # ── 1단계: 준비운동 (웜업) ──
+        # ── 1단계: 준비운동 (웜업, 버림) ──
         warmup_results = await fire_phase("warmup", WARMUP_N)
 
-        # ── 2단계: 웜업 건강 검진 ──
-        # 에러율이 너무 높거나 TTFT가 비정상이면 → 실전 스킵 (서버 과부하 방지)
-        ok = [r for r in warmup_results if r.status == "success"]
-        fail_rate = 1.0 - len(ok) / max(len(warmup_results), 1)
-        ttfts = sorted(r.ttft_s for r in ok if r.ttft_s is not None)
-        ttft_p99 = ttfts[int(len(ttfts) * 0.99)] if ttfts else 0.0
-
-        aborted = fail_rate > ABORT_FAIL_RATE or ttft_p99 > ABORT_TTFT_P99_S
-
-        # ── 3단계: 실전 측정 (또는 스킵) ──
-        measured_results: list[Result] = []
-        if not aborted:
-            measured_results = await fire_phase("measured", MEASURED_N)
-        else:
-            print(
-                f"  ABORT: fail_rate={fail_rate:.2f} ttft_p99={ttft_p99:.1f}s"
-                f" — skipping measured phase",
-                flush=True,
-            )
+        # ── 2단계: 실전 측정 (항상 실행) ──
+        # 에러율/TTFT abort 게이트 제거: 느리거나 실패하는 config도 그대로 측정해 데이터에 남긴다.
+        # (분석은 status=="success"만 필터하므로 오염 없음. 느린 요청 자르기는 안 함 — 위 total=None.)
+        measured_results = await fire_phase("measured", MEASURED_N)
 
         all_results = warmup_results + measured_results
 
-    # ── 4단계: 결과를 JSONL 파일로 저장 (한 줄에 요청 1개의 전체 측정값) ──
+    # ── 3단계: 결과를 JSONL 파일로 저장 (한 줄에 요청 1개의 전체 측정값) ──
     with open(out_path, "w") as f:
         for r in all_results:
             f.write(json.dumps(asdict(r)) + "\n")
 
-    return not aborted
+    return True   # measured 항상 실행 → 항상 .done (abort 게이트 제거)
 
 
 # ── S3 sync (백그라운드 자동 백업) ─────────────────────────────────────────────
