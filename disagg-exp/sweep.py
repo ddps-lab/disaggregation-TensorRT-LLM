@@ -37,6 +37,8 @@ from pathlib import Path
 
 import aiohttp
 
+import prom_scrape   # per-side(prefill/decode) RPS 스크레이퍼 — 공식이 못 주는 유일한 커스텀 조각
+
 # ── grid (실험 조건표) ────────────────────────────────────────────────────────
 # 벤치마크에서 테스트할 조건들을 정의합니다.
 # 환경변수로 오버라이드 가능하며, 기본값은 아래와 같습니다.
@@ -199,8 +201,13 @@ async def run_point(
     decode_len: int,
     rate: float,
     out_path: Path,
+    prom_out: Path | None = None,
 ) -> bool:
-    """항상 warmup → measured 실행 후 JSONL 저장. 항상 True 반환 (abort 게이트 제거)."""
+    """항상 warmup → measured 실행 후 JSONL 저장. 항상 True 반환 (abort 게이트 제거).
+    prom_out 지정 시 measured 윈도우 전/후로 orchestrator /prometheus/metrics를 스냅샷해
+    per-side(prefill/decode) RPS 산출용 원본을 저장(warmup 제외 = 변인통제)."""
+
+    before_prom = after_prom = None   # async with 밖에서 읽으므로 미리 None
 
     # limit=0: 동시 연결 수 제한 없음 (수백 개 요청이 동시에 날아감)
     connector = aiohttp.TCPConnector(limit=0)
@@ -225,12 +232,19 @@ async def run_point(
             return results
 
         # ── 1단계: 준비운동 (웜업, 버림) ──
+        # warmup의 모든 요청은 fire_phase 안에서 await 완료되므로, measured 시작 시점엔 이미 drain됨
+        # → 아래 before 스냅샷은 warmup 완료분까지만 포함(깨끗한 측정 윈도우 경계).
         warmup_results = await fire_phase("warmup", WARMUP_N)
 
         # ── 2단계: 실전 측정 (항상 실행) ──
         # 에러율/TTFT abort 게이트 제거: 느리거나 실패하는 config도 그대로 측정해 데이터에 남긴다.
         # (분석은 status=="success"만 필터하므로 오염 없음. 느린 요청 자르기는 안 함 — 위 total=None.)
+        # per-side 카운터를 measured 윈도우만 정확히 bracket (warmup 제외).
+        if prom_out is not None:
+            before_prom = await prom_scrape.snapshot(session, base_url)
         measured_results = await fire_phase("measured", MEASURED_N)
+        if prom_out is not None:
+            after_prom = await prom_scrape.snapshot(session, base_url)
 
         all_results = warmup_results + measured_results
 
@@ -238,6 +252,12 @@ async def run_point(
     with open(out_path, "w") as f:
         for r in all_results:
             f.write(json.dumps(asdict(r)) + "\n")
+
+    # ── 3-b: per-side 스냅샷 저장 (analyze가 RPS=(after-before)/window_s 계산) ──
+    if prom_out is not None and before_prom is not None and after_prom is not None:
+        window_s = after_prom.get("ts", 0) - before_prom.get("ts", 0)
+        with open(prom_out, "w") as f:
+            json.dump({"before": before_prom, "after": after_prom, "window_s": window_s}, f)
 
     return True   # measured 항상 실행 → 항상 .done (abort 게이트 제거)
 
@@ -476,7 +496,8 @@ async def main(args: argparse.Namespace) -> None:
         print(f"[{done+1}/{len(points)}] prefill={prefill_len} decode={decode_len} rate={rate} ...", flush=True)
 
         try:
-            ok = await run_point(base_url, config, prefill_len, decode_len, rate, out_path)
+            ok = await run_point(base_url, config, prefill_len, decode_len, rate, out_path,
+                                  prom_out=out_dir / f"prom_{point_id}.json")
         except Exception as exc:
             print(f"  ERROR: {exc}", flush=True)
             marker_failed.touch()

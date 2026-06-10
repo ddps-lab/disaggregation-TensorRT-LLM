@@ -167,6 +167,59 @@ def load_perf(config_dir: Path, point_id: str) -> dict:
     return out
 
 
+def load_prom(config_dir: Path, point_id: str, rows: list[dict]) -> dict:
+    """prom_{point_id}.json (orchestrator /prometheus/metrics measured-윈도우 전/후 스냅샷)에서
+    per-side RPS를 계산하고, 강제된 토큰길이로 per-side TPS를 파생.
+
+    - prefill_rps = (ctx_after − ctx_before) / window_s,  decode_rps = (gen_after − gen_before)/window_s
+      (ctx_/gen_completed_requests_total, prom_scrape.py 참조)
+    - per-side TPS는 공식 토큰 카운터가 없어(병렬화-KV전송-측정.md §6) RPS × 토큰수로 파생.
+      토큰수 = 실측 mean(prompt/completion_tokens), 없으면 강제 목표 prefill_len/decode_len 폴백.
+    파일 없으면(=스크레이프 비활성/orchestrator 미노출) 빈 dict → 표에 'n/a'."""
+    pf = config_dir / f"prom_{point_id}.json"
+    if not pf.exists():
+        return {}
+    try:
+        snap = json.loads(pf.read_text())
+    except Exception:
+        return {}
+    if not isinstance(snap, dict):
+        return {}
+    before = snap.get("before") or {}
+    after = snap.get("after") or {}
+    window_s = snap.get("window_s")
+    if not window_s or window_s <= 0:                       # window_s 누락 시 ts로 폴백
+        window_s = (after.get("ts") or 0) - (before.get("ts") or 0)
+    if not window_s or window_s <= 0:
+        return {}
+
+    def _rps(side: str):
+        b, a = before.get(side), after.get(side)
+        if b is None or a is None:
+            return None
+        d = a - b
+        return d / window_s if d >= 0 else None             # 카운터 리셋 등 음수면 무효
+
+    pf_rps, dc_rps = _rps("ctx"), _rps("gen")
+
+    ok = [r for r in rows if r.get("status") == "success"]
+    pts = [r["prompt_tokens"] for r in ok if r.get("prompt_tokens")]
+    cts = [r["completion_tokens"] for r in ok if r.get("completion_tokens")]
+    mean_pt = (sum(pts) / len(pts)) if pts else (ok[0].get("prefill_len") if ok else None)
+    mean_ct = (sum(cts) / len(cts)) if cts else (ok[0].get("decode_len") if ok else None)
+
+    out: dict = {}
+    if pf_rps is not None:
+        out["prefill_rps"] = pf_rps
+        if mean_pt:
+            out["prefill_tps"] = pf_rps * mean_pt
+    if dc_rps is not None:
+        out["decode_rps"] = dc_rps
+        if mean_ct:
+            out["decode_tps"] = dc_rps * mean_ct
+    return out
+
+
 def dollar_per_m_tokens(stats: dict, config: str) -> float:
     """$/M output tokens using e2e throughput and on-demand price."""
     thr = stats.get("thr_tok_s_e2e", 0)
@@ -184,6 +237,7 @@ def print_table(all_stats: dict[str, dict[str, dict]]) -> None:
         f" {'ttft_p50ms':>11} {'ttft_p99ms':>11}"
         f" {'tpot_p50ms':>11} {'tpot_p99ms':>11}"
         f" {'thr_e2e':>9} {'$/Mtok':>8} {'kv_p50ms':>9} {'kv_p99ms':>9}"
+        f" {'pf_rps':>7} {'dc_rps':>7} {'pf_tps':>8} {'dc_tps':>8}"
     )
     print(header)
     print("-" * len(header))
@@ -199,11 +253,18 @@ def print_table(all_stats: dict[str, dict[str, dict]]) -> None:
             kv99 = s.get("kv_transfer_p99_ms")
             kv50s = f"{kv50:>9.2f}" if kv50 is not None else f"{'n/a':>9}"
             kv99s = f"{kv99:>9.2f}" if kv99 is not None else f"{'n/a':>9}"
+            pf_rps = s.get("prefill_rps"); dc_rps = s.get("decode_rps")
+            pf_tps = s.get("prefill_tps"); dc_tps = s.get("decode_tps")
+            pf_rs = f"{pf_rps:>7.2f}" if pf_rps is not None else f"{'n/a':>7}"
+            dc_rs = f"{dc_rps:>7.2f}" if dc_rps is not None else f"{'n/a':>7}"
+            pf_ts = f"{pf_tps:>8.0f}" if pf_tps is not None else f"{'n/a':>8}"
+            dc_ts = f"{dc_tps:>8.0f}" if dc_tps is not None else f"{'n/a':>8}"
             print(
                 f"{config:<8} {point_id:<32} {s['n_ok']:>6} {s['fail_rate']*100:>5.1f}%"
                 f" {s['ttft_p50_ms']:>11.1f} {s['ttft_p99_ms']:>11.1f}"
                 f" {s['tpot_p50_ms']:>11.1f} {s['tpot_p99_ms']:>11.1f}"
                 f" {s['thr_tok_s_e2e']:>9.1f} {dpm:>8.3f} {kv50s} {kv99s}"
+                f" {pf_rs} {dc_rs} {pf_ts} {dc_ts}"
             )
 
 
@@ -284,7 +345,8 @@ def main(args: argparse.Namespace) -> None:
         for point_id, rows in sorted(points.items()):
             _warn_pt_delta(rows, point_id)
             s = analyze_point(rows)
-            s.update(load_perf(log_dir / config, point_id))   # KV전송시간 등 perf 병합(있으면)
+            s.update(load_perf(log_dir / config, point_id))          # KV전송시간 등 perf 병합(있으면)
+            s.update(load_prom(log_dir / config, point_id, rows))    # per-side RPS/TPS 병합(있으면)
             all_stats[config][point_id] = s
 
     if not all_stats:

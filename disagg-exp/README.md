@@ -19,6 +19,7 @@
 | **`ctx_extra_llm_api_options.yaml`** | **context(prefill) 워커**의 변인통제 (bf16·TRTLLM attn·block_reuse off·chunked off·cuda_graph off·overlap off). | 🆕 **신규**. vLLM에선 CLI 플래그(`--no-enable-prefix-caching` 등)였던 걸 TRT-LLM은 이 YAML로. |
 | **`gen_extra_llm_api_options.yaml`** | **generation(decode) 워커**의 변인통제 (cuda_graph on·overlap on). | 🆕 **신규**. (동상) |
 | **`disagg_config.yaml`** | orchestrator(=`trtllm-serve disaggregated`)가 읽는 **1P1D 정적 템플릿** (수동 실행/참조용). | 🆕 **신규** (vLLM의 `disagg_proxy_server.py`를 대체하는 개념). |
+| **`prom_scrape.py`** | **per-side 스크레이퍼**. orchestrator `/prometheus/metrics`의 `ctx_/gen_completed_requests_total`를 measured 윈도우 전/후로 스냅샷 → prefill/decode RPS 산출용. sweep가 호출, analyze가 RPS·TPS 계산. | 🆕 **신규** (공식 도구가 per-side를 안 줌 — 유일한 커스텀 메트릭 조각). |
 | **`trtllm_support_matrix.md`** | **Phase 0 게이트** 결과표 — 어떤 (TP,PP) 조합이 안 깨지나 실측 기록. | 🆕 **신규** (TRT-LLM은 비대칭 PP가 미보증이라 사전 게이트 필요). |
 
 **❌ vLLM에 있었지만 안 가져온 것 (TRT-LLM에 불필요):**
@@ -131,10 +132,11 @@ bash launch_trtllm.sh proxy
 **측정 산출물** (`$EXP_LOG_DIR/<config>/`):
 - `p{..}.jsonl` — 요청별 TTFT/E2E/status (sweep)
 - `perf_p{..}.json` — `/perf_metrics` 스냅샷(KV전송시간·블록재사용) ★
+- `prom_p{..}.json` — measured 윈도우 전/후 per-side 카운터 스냅샷(prefill/decode RPS 산출용) ★
 - `metadata.json` — ctx/gen TP·PP·xPyD·placement·cache_backend
 - 시스템: `nvidia_smi.csv`·`ifstat.csv`·`dcgm.log` (1Hz/2s), `s3_sync.log`, `clock_baseline_*`
 
-**분석**: `analyze.py --plot` → TTFT/TPOT/throughput(2종)/$Mtok **+ `kv_p50ms`/`kv_p99ms`(KV전송시간)** 표·플롯.
+**분석**: `analyze.py --plot` → TTFT/TPOT/throughput(2종)/$Mtok + `kv_p50ms`/`kv_p99ms`(KV전송시간) **+ `pf_rps`/`dc_rps`/`pf_tps`/`dc_tps`(per-side prefill/decode RPS·TPS)** 표·플롯. (per-side는 prom_*.json 있을 때만, 없으면 'n/a')
 
 **디버깅 / 로그구조 / KV·perf 읽는 법 / hang 진단 / 디버그 토글 켜고 끄기 → `DEBUGGING.md`.**
 > ⚠️ 측정 런에선 디버그 로그 OFF(`LOG_LEVEL` 미설정). 디버그 로그 = I/O 노이즈 → 변인 오염.

@@ -96,6 +96,14 @@ git push -u origin disagg-exp/trtllm-v1.2.1        # push 완료
 - **파일맵 정정**: CLAUDE.md 파일맵을 6종(stale)→8종 표로 교체 = 정본 문서 인덱스(역할·언제 여나·정본항목). README 파일-역할 표는 코드파일용이라 유지.
 - 산출물·코드 변경 없음(문서만). 문서 8종 유지, 역할 명확화 + 중복 0 목표.
 
+## 2026-06-10 (5) — per-side 측정 구현 (소스 전수조사 → 검증 → 코드)
+- **조사**(9-에이전트 워크플로우, 411k 토큰): v1.2.1 소스에서 원하는 8개 메트릭(prefill/decode RPS·TPS + 전체 TTFT·TPOT·throughput·latency)의 공식-vs-커스텀을 코드단 확정. 핵심 3주장 적대적 검증.
+  - **결과**: 전체 4개 = 공식(우리 sweep이 이미 동일 정의로 측정). per-side RPS = orchestrator :8000 `/prometheus/metrics`의 `ctx_/gen_completed_requests_total`(단일 엔드포인트, role 접두) 윈도우 차분 = 거의 공식. per-side TPS = **유일 공식불가**(토큰 카운터 0개 confirmed) → RPS×고정길이 파생.
+  - **검증 정정**: ① benchmark_serving E2EL은 기본 출력에서 빠짐(`--percentile-metrics`에 e2el 필수) — 단 우리 sweep은 e2e_s 직접 측정해 무관. ② per-side RPS 워커 카운터 차분 confirmed + orchestrator 단일 엔드포인트가 더 깔끔.
+- **구현**(3파일): `prom_scrape.py` 신규(Prometheus 텍스트 파서 + orchestrator 스냅샷, graceful), `sweep.py`(run_point에 `prom_out` — measured 윈도우 전/후 스냅샷 → `prom_*.json`, warmup 제외), `analyze.py`(`load_prom` — RPS=Δ/window, TPS=RPS×mean(token), 표 컬럼 `pf_rps/dc_rps/pf_tps/dc_tps`).
+- **검증**: py_compile(3.9) + 기능테스트(3.11, aiohttp/numpy 스텁): 파서·_pick(_total 자동매칭)·load_prom(RPS/TPS 산식)·graceful(파일없음/None/window0)·토큰길이 폴백 전부 PASS. **런타임(카운터 실노출)은 GPU 스모크에서**(병렬화-KV전송-측정.md §9).
+- 문서: 병렬화-KV전송-측정.md §6/§7/§9 + CLAUDE 파일맵 + README(§1 prom_scrape·§5 prom_*.json·분석컬럼).
+
 ## 아직 안 한 것 / 주의 (코드에서 확정 못 함 → GPU에서)
 - 로컬에서 TRT-LLM **빌드/실행 안 함** (컨테이너로 원격에서). 코드 정확성은 정적, **동작 검증은 GPU**.
 - 컨테이너 `nvcr.io/nvidia/tensorrt-llm/release:1.2.1` 실제 pull·기동, Qwen3-4B 로드, KV전송 동작, 출력정확성(비분리 비교) = 전부 Phase 0.
