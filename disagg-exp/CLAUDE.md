@@ -5,6 +5,7 @@
 > 베이스: `NVIDIA/TensorRT-LLM` fork → `ddps-lab/disaggregation-TensorRT-LLM`, 브랜치 `disagg-exp/trtllm-v1.2.1` (태그 `v1.2.1` 기준).
 
 ## ⚠️ 작업 방침 (반드시 지킬 것)
+- **코드 작성 흐름 (2026-06-10~)**: Claude가 작성. ① v1.2.1 소스 정밀 분석으로 CLI/스키마/키 확정 → ② 코드 작성 → ③ 소스 대조 검증(디버깅 최소화) → ④ 원격 GPU에서 테스트. *추측으로 짜지 말 것 — 코드에서 확인한 사실 위에서만.*
 - **공식 코드·방법만 사용** (논문 재현성). 커스텀 해킹 금지. TRT-LLM 공식 `examples/disaggregated/` 패턴을 출발점으로.
 - **모든 런타임(서버 기동/추론/벤치)은 원격 EC2에서 SSH로.** 로컬(Mac)은 파일 편집·git 전용. (aws skill 규칙)
 
