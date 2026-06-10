@@ -103,7 +103,23 @@ generation_servers:
   - `SETUP_LOG.md` — 한 작업의 시간순 로그 + provenance (나중 정리/methods용).
   - `LEARNING_NOTES.md` — 개념 중심 공부 노트 (fork/lfs/핀/PD분리/비대칭TP·PP/xPyD/메트릭…). 살아있는 문서.
 
-## 관련 조사 기록 (글로벌 메모리)
-- `pd-disagg-parallelism-framework-verdict` — 프레임워크 비교(왜 TRT-LLM, vLLM/SGLang 배제).
-- `trtllm-disagg-decision` — 채택 결정 + 제약.
-- `disagg-exp-experiment-overview` — vLLM 1세대 → TRT-LLM 2세대 전체 개요.
+## 프레임워크 선택 근거 + 배경 (구 글로벌 메모리 통합 — 이 문서가 단일 진실원)
+
+### 프레임워크 판정 (왜 TRT-LLM, 나머지 배제 — 공식 코드/이슈/PR로 검증 2026-06)
+- **vLLM**: 비대칭 TP는 NixlConnector만 가능. **PP-in-PD 불가**(KV 전송 프로토콜에 PP 필드 없음, #40674). LMCache는 둘 다 ❌. → **배제.** (← 이 실험이 vLLM에서 넘어온 직접 이유)
+- **SGLang**: PD KV 전송이 PP-aware(`base/conn.py`의 `KVArgs`에 `pp_rank`/`prefill_start_layer`/`prefill_end_layer`)하지만, **임의 비대칭 PP는 하드 assert로 차단** — `common/conn.py`의 `_resolve_rank_mapping`에 `assert pp_size == info.pp_size or pp_size == 1` ("Decode pp size should be equal to prefill pp size or 1"). 즉 **"prefill PP=N → decode PP=1" gather만** 가능. **대칭 PP-in-PD조차 크래시/출력손상 버그**(#15571 `PPMissingLayer.quant_method`, #16246; 수정 #19804는 #21189로 리버트). 비대칭 TP는 MLA 견고/비-MLA는 부하버그 #15674 OPEN. 무RDMA는 `mooncake_tcp` 또는 NIXL/UCX-TCP. ⚠️ **`--disaggregation-decode-tp` 플래그는 없음** — 비대칭 TP는 각 서버에 다른 `--tp-size`. → **배제.**
+- **TensorRT-LLM**: **임의 비대칭 PP+TP를 1급으로 지원하는 유일한 유지보수 프로덕션 엔진**(context/generation 서버별 독립 tp/pp, UCX-over-TCP로 무EFA 가능). C++ `cacheFormatter.cpp::inquireSupport`는 PP 조합이 아니라 KV 동질성(dtype·head수·layer수·non-MLA·beam=1)만 검사 → dense GQA 충족. → **채택.**
+- **Dynamo / llm-d**: vLLM 백엔드의 PP 한계를 그대로 상속 → 비대칭 PP 불가.
+- **DistServe**(연구용): 비대칭 TP+PP는 깔끔하나 **per-phase DP 없음** + **CUDA IPC라 멀티노드 KV 전송 불가** → 단일노드 소형모델 연구용.
+
+### DP 교차사실 (dense 모델 한정 — 중요)
+"DP 안 됨"은 TRT-LLM 한정이 아니라 **dense GQA에선 어떤 엔진에서도 DP가 독립 모델-병렬 축이 아님**. DP의 3가지 의미: (1) 독립 샤딩 knob — TRT-LLM엔 아예 없음, vLLM/SGLang `--data-parallel-size`는 dense를 통째 복제, (2) attention-DP — MLA/MoE 전용(GQA 무의미), (3) 복제본 수/xPyD — 이것만 해당(리소스 배분). → **실험의 진짜 독립 축 = TP·PP 둘. DP는 인스턴스 수(xPyD)로만.** DP/EP를 진짜 축으로 보려면 MLA/MoE 모델(DeepSeek) 필요.
+
+### T4(SM75) 교차사실 (중요)
+T4 미지원은 **TRT-LLM·Dynamo만의 문제(최소 SM80)**. vLLM=T4 지원(SM75), SGLang=되나 과도기(prebuilt 휠에서 sm75 제거 #9207 → 소스빌드/구버전 핀 + Triton 3.2.0 다운). → 우리는 **T4 불필요 확정** → g5/g6/g6e(전부 SM80+).
+
+### 1세대(vLLM) 배경 — 방법론의 출처
+vLLM v0.21 fork + LMCache/NIXL, **Llama-3.1-8B**, AWS. 7개 config — monolithic(A1 TP2PP2 / A2 TP4PP1 / A3 TP1PP4, 4×T4) vs single big GPU(B, L40S) vs same-node PD(C, 4×T4 shm) vs cross-node PD(D, 2×L4 TCP). 측정 TTFT/TPOT/$per-Mtoken. vLLM이 **PD에서 PP 불가**라 2세대(TRT-LLM+Qwen3-4B)로 이전하며 sweep.py·analyze.py·setup.sh·2-phase·변인통제 **계승**. 원본 = `../vllm-disaggregation/disagg-exp/`.
+
+### 전략 메모
+Qwen3-4B(및 Llama-8B)는 GPU 1장에 올라가므로 **PP는 "크로스노드 메모리 분산" 용도** — 그게 바로 대부분 프레임워크에서 막힌 케이스(= 이 연구가 파고드는 지점). PP를 축으로 보는 연구적 의미가 약하면 더 큰 모델도 고려 가능.
