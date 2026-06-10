@@ -104,34 +104,40 @@ vLLM처럼 커넥터 클래스를 고르는 게 아니라, **disagg YAML / 워�
 
 ---
 
-## 6. per-side 측정 — prefill RPS/TPS vs decode RPS/TPS (vLLM MetricsScraper의 TRT-LLM 대응)
+## 6. per-side 측정 — prefill RPS/TPS vs decode RPS/TPS (소스 전수조사 + 적대적 검증 완료 2026-06-10)
 
-vLLM은 각 노드 `/metrics`의 누적 토큰 카운터를 1초 차분해 per-side를 구했다. **TRT-LLM은 메커니즘이 다르다 — 그대로 이식하면 깨진다.**
+vLLM은 각 노드 `/metrics`의 누적 토큰 카운터를 1초 차분해 per-side를 구했다. **TRT-LLM은 메커니즘이 다르다 — 그대로 이식하면 깨진다.** 9-에이전트 워크플로우로 v1.2.1 소스를 전수조사하고 핵심 3주장을 적대적으로 검증한 결과:
 
-| 지표 | vLLM(차용 안 함) | **TRT-LLM 실제** |
+| 지표 | 공식 가능? | **TRT-LLM 실제 소스** |
 |---|---|---|
-| per-side **RPS** | `vllm:request_success_total` 차분 | **`trtllm_request_success_total`** 워커별 차분 ✅ (vLLM식 OK) |
-| per-side **TPS** | `prompt/generation_tokens_total` 차분 | **누적 토큰 카운터 없음** → **RPS × 고정 ISL/OSL** (그리드가 길이 고정) |
+| per-side **RPS** | 🟡 부분공식 | **orchestrator :8000 `/prometheus/metrics`의 `ctx_completed_requests_total` / `gen_completed_requests_total`** (단일 엔드포인트, role 접두사) 윈도우 차분. 대안=워커별 `trtllm_request_success_total` |
+| per-side **TPS** | ❌ 공식불가(검증 confirmed) | **누적 토큰 카운터가 어디에도 없음** → **RPS × 고정 ISL/OSL**(그리드가 길이 고정, 우리가 강제) |
 
-**함정(핵심):**
-1. 진짜 Prometheus는 워커 `/metrics`가 아니라 **`/prometheus/metrics`** (워커 `/metrics`는 Prometheus 텍스트가 아니라 **iteration stats JSON 리스트** → 스크레이퍼로 붙이면 깨짐). `return_perf_metrics:true`일 때만 마운트(우리 ctx/gen YAML 이미 켜둠).
-2. orchestrator(:8000) `/metrics`는 **404** → 반드시 워커 포트(ctx :8001, gen :8011)로.
-3. `numCtxTokens`/`numGenTokens`는 누적이 아니라 **per-iteration 순간값** → 차분 금지. (PyTorch 백엔드는 numGenTokens 자체 미기록.)
-4. ctx 워커=prefill만, gen 워커=decode만 → **워커별로 따로 긁으면 side 분리는 자연히 됨.**
+**핵심 발견 (vLLM 대비 더 깔끔):**
+- **orchestrator(:8000)가 per-side 카운터를 단일 엔드포인트로 노출**한다. `instance_metric()`이 role별 접두사(`ctx`/`gen`)를 붙여 `completed_requests` Counter를 만들고(perf_metrics.py:93-111), prometheus_client이 `_total`을 자동 부착 → `ctx_completed_requests_total`/`gen_completed_requests_total`. ctx=prefill 완료, gen=decode 완료를 각각 셈(openai_client.py:267 `.inc()`). **워커별로 돌아다닐 필요 없음.**
+- per-side **TPS는 진짜 공식 불가**: `/prometheus/metrics`엔 `request_success_total` + 4개 latency 히스토그램뿐, **토큰 카운터 0개**(collector.py:27-68). 워커 `/perf_metrics` per-request 레코드에도 토큰 필드 없음(timing/kv만, openai_server.py:414-452). → 토큰수는 **우리가 강제한 길이**(token-id prompt=prefill_len, max_tokens+ignore_eos=decode_len)로 곱해 파생, `usage.prompt/completion_tokens`로 검증.
+
+**함정(정정 포함):**
+1. orchestrator(:8000)엔 `/metrics`가 **없음(404)** 이지만 **`/prometheus/metrics`는 있음**(openai_disagg_server.py:156-158) — 여기에 ctx_/gen_ 카운터 족(族)이 노출됨. *(과거 메모: "orchestrator는 워커 포트로만" → 정정: per-side RPS는 orchestrator 단일 엔드포인트가 1순위.)*
+2. 워커 `/metrics`(JSON iteration stats)와 워커 `/prometheus/metrics`(진짜 Prometheus, `return_perf_metrics:true`일 때만)는 다름 — 후자만 스크레이프. `numCtxTokens`/`numGenTokens`는 per-iteration 순간값이라 차분 금지.
+3. 카운터는 워커가 `return_perf_metrics`로 떠야 생김(openai_server.py:138). ctx/gen extra YAML에 이미 켜둠.
 
 **측정 방식(채택):**
-- per-side **RPS** = 워커별 `/prometheus/metrics`의 `trtllm_request_success_total` 1초 차분 + active-window 필터(vLLM 알고리즘 차용, 대상만 TRT-LLM).
-- per-side **TPS** = `prefill_tps = prefill_rps × ISL`, `decode_tps = decode_rps × OSL` (그리드가 ISL/OSL 고정).
-- **KV 전송시간**(side 분해의 보조) = orchestrator `/perf_metrics`의 `gen_perf_metrics[.perf_metrics].timing_metrics.kv_cache_transfer_end-start` (현 sweep.py가 수집).
-- 근거: `tensorrt_llm/metrics/collector.py` (노출 메트릭 전부 = `trtllm_request_success_total` + e2e/ttft/tpot/queue 히스토그램, **토큰 카운터 없음**), `serve/openai_server.py:259-318`(/metrics=JSON, /prometheus/metrics 마운트, /perf_metrics), `:386-453`.
+- per-side **RPS** = orchestrator `/prometheus/metrics`를 **measured 윈도우 시작/끝에 1회씩 스냅샷** → `(end−start)/window_s`. (warmup 제외 = 변인통제). 1순위 키 `ctx_/gen_completed_requests_total`, 폴백 = 워커 `trtllm_request_success_total` 합.
+- per-side **TPS** = `prefill_tps = prefill_rps × mean(prompt_tokens)`, `decode_tps = decode_rps × mean(completion_tokens)` (analyze.py, ~5줄).
+- **전체 TTFT/TPOT/throughput** = 우리 sweep.py가 이미 측정(공식 benchmark_serving과 정의 동일). **전체 latency(E2EL)**도 sweep `e2e_s`로 직접 측정 — *공식 benchmark_serving은 E2EL이 기본 출력에서 빠짐*(§7).
+- **KV 전송시간**(side 분해 보조) = orchestrator `/perf_metrics`의 `gen_perf_metrics[.perf_metrics].timing_metrics.kv_cache_transfer_end−start` (현 sweep.py 수집).
+- 근거: perf_metrics.py:71,92-113(role 접두 카운터), openai_client.py:267(.inc), collector.py:27-68(워커 메트릭=토큰카운터 0), openai_server.py:138,414-452, openai_disagg_server.py:156-158.
 
 ---
 
 ## 7. 부하/측정 도구 — 공식 최대 + per-side만 커스텀 (vLLM 공식 벤치 브랜치 철학)
 
-- **공식 부하 도구**: `python -m tensorrt_llm.serve.scripts.benchmark_serving` — vLLM `benchmark_serving.py`의 fork, **공식 disagg slurm 벤치(`examples/disaggregated/slurm/benchmark/run_benchmark.sh`)가 호출**. orchestrator :8000 OpenAI를 침. token-id ISL 고정(`--random-ids --tokenize-on-client --random-range-ratio 0`)·`--ignore-eos`·OSL(`--random-output-len`)·Poisson(`--request-rate --burstiness 1.0`)·`--max-concurrency`·TTFT/TPOT/ITL/E2EL 전부 커버. (TPOT 정의도 우리 analyze.py와 동일.)
+- **공식 부하 도구**: `python -m tensorrt_llm.serve.scripts.benchmark_serving` — vLLM `benchmark_serving.py`의 fork, **공식 disagg slurm 벤치(`examples/disaggregated/slurm/benchmark/run_benchmark.sh`)가 호출**. orchestrator :8000 OpenAI를 침. token-id ISL 고정(`--random-ids --tokenize-on-client --random-range-ratio 0`)·`--ignore-eos`·OSL(`--random-output-len`)·Poisson(`--request-rate --burstiness 1.0`)·`--max-concurrency` 지원.
+- ⚠️ **검증으로 잡은 함정 — E2EL은 기본 출력에서 빠짐**: 결과 JSON에 throughput(무조건)·TTFT·TPOT는 기본(`--percentile-metrics`=`ttft,tpot,itl`)으로 나오지만 **E2EL(전체 latency)는 안 나옴**. `--percentile-metrics ttft,tpot,itl,e2el`을 줘야 `*_e2el_ms`가 출력됨(benchmark_serving.py:537-539, 공식 run_benchmark.sh:71은 이미 e2el 포함). → 공식 도구를 쓸 땐 이 플래그 필수. **단 우리 sweep.py는 `e2e_s`를 직접 재므로 무관.**
+- **단일 엔드포인트 한계**: benchmark_serving은 한 base-url만 침(benchmark_serving.py:703-708) → **per-side를 못 냄**(전체 RPS만). per-side는 별도 스크레이퍼 필요.
 - `trtllm-bench`는 `--engine_dir` in-process라 serving 엔드포인트 못 침 → 부하 도구 아님.
-- **권고**: 부하 코어=공식 benchmark_serving, **커스텀=per-side MetricsScraper + 디버깅(/perf_metrics·수집기)뿐**, sweep.py는 오케스트레이터(그리드·resume·S3·metadata) 유지.
+- **채택 구조**: sweep.py를 **부하코어 겸 오케스트레이터로 유지**(전체메트릭을 공식과 정의-동일하게 이미 측정 + measured 윈도우 전후로 per-side 스크레이프를 끼워넣을 수 있음 — 단일엔드포인트 benchmark_serving은 못 하는 것). 커스텀=**per-side 스크레이퍼(`prom_scrape.py`) + analyze per-side**뿐. 공식 benchmark_serving은 **선택적 교차검증**(`sweep_official.py`)으로 전체메트릭 일치 확인(논문 비교가능성).
 
 ---
 
@@ -144,9 +150,12 @@ vLLM은 각 노드 `/metrics`의 누적 토큰 카운터를 1초 차분해 per-s
 
 ---
 
-## 9. 검증 방법 / TODO ("코드가 안 막음 ≠ 됨" → 확정)
-- [ ] **Phase 0 게이트**: 대칭/비대칭 TP → PP 조합을 실제 기동/KV전송/출력정확성으로 실측 → `trtllm_support_matrix.md`. (특히 ctx-PP→gen-TP #14020 hang 300s 감시)
-- [ ] **per-side RPS 스모크**: P1D1에서 ctx :8001·gen :8011 `/prometheus/metrics`에 `trtllm_request_success_total` 노출 확인 + 워커별 차분 = client RPS와 정합.
-- [ ] **per-side TPS**: prefill_rps×ISL / decode_rps×OSL이 benchmark_serving의 시스템 throughput과 정합한지 한 점에서 대조.
-- [ ] **KV전송시간 깊이**: `/perf_metrics`에서 `gen_perf_metrics.timing_metrics` vs `.perf_metrics.timing_metrics` 실제 키 깊이 확인(파서는 둘 다 대응).
-- [ ] benchmark_serving 단발 호출로 ISL/OSL 고정·TPOT 정의 대조.
+## 9. 검증 방법 / TODO ("소스가 정의함 ≠ 런타임에 노출됨" → GPU 스모크로 확정)
+소스는 확정(고신뢰). 남은 건 **런타임 노출**뿐 — P1D1 스모크에서 `curl :8000/prometheus/metrics`로 실측:
+- [ ] **orchestrator per-side 카운터 실재 확인**: `ctx_completed_requests_total`·`gen_completed_requests_total`이 **non-zero로 노출**되나(role 접두 `ctx`/`gen` 적용, 단일 uvicorn에서 멀티프로세스 분실 없는지). 빠지면 폴백=워커 `trtllm_request_success_total`.
+- [ ] **global vs per-worker**: ctx_/gen_completed가 role 전체 집계인지 워커별인지 → **1P3D**에서 decode RPS를 인스턴스별로 봐야 하면 워커별 `trtllm_request_success_total`로.
+- [ ] **ctx↔gen 1:1**: 분리에선 요청 1개=ctx 1회+gen 1회 → 정상상태에서 `ctx_completed≈gen_completed`인지(재시도/다중응답 인플레 없는지) → `TPS=RPS×len` 성립 확인.
+- [ ] **per-side TPS 정합**: `decode_rps×decode_len`이 전체 output throughput과 noise 내 일치하는지 한 점 대조.
+- [ ] **윈도우 정렬**: 카운터 스냅샷 wall-clock 간격 vs sweep send-타임스탬프 윈도우가 achieved_rate와 noise 내 정합.
+- [ ] **(선택) ctx_/gen_ latency 히스토그램**(`gen_first_token_latency_seconds` 등 openai_client.py:186,237,241,251 `.observe()`)이 non-zero `_count/_sum`이면 per-side TTFT/TPOT 공식 교차검증 가능.
+- [ ] **Phase 0 게이트**(병행): TP·PP 조합 실측 → `trtllm_support_matrix.md` (ctx-PP→gen-TP #14020 hang 300s 감시).
