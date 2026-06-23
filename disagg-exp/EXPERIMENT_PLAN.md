@@ -54,7 +54,7 @@
 
 ### ②~④ 클라이언트·메트릭·인프라 통제 → 정본 **`CLAUDE.md` §변인통제**
 중복 서술 대신 정본을 가리킨다. 여기선 이 실험의 **계승 포인트**(무엇을 vLLM에서 그대로 잇나)만:
-- **클라(`sweep.py` 계승)**: token-id prompt로 `prefill_len` 고정 + `ignore_eos`/`max_tokens`로 `decode_len` 강제, `stream`으로 **클라에서 TTFT/E2E 직접 측정**(서버 메트릭은 PD 파이프 전체를 못 봄), Poisson 도착, 2-phase(warmup 20→measured 300), abort게이트·클라 타임아웃 없음, 포인트당 `/perf_metrics` 1회 폴링(KV전송시간). 점검만: Qwen3 토크나이저 token-id 경로 호환. *값·근거 상세=CLAUDE.*
+- **부하·측정(공식 `benchmark_serving`, sweep는 오케스트레이션 — 2026-06-11)**: sweep가 포인트마다 공식 도구를 서브프로세스 호출(`--random-ids --tokenize-on-client --random-range-ratio 0`로 token-id ISL 고정, `--ignore-eos`로 OSL, `--request-rate --burstiness 1.0` Poisson, `--percentile-metrics ttft,tpot,itl,e2el`). warmup=measured 전 소량 `--non-streaming` 호출. 포인트당 `/perf_metrics` 1회 폴링(KV) + per-side 스냅샷. *상세=CLAUDE / 병렬화-KV전송-측정 §7.*
 - **메트릭(`analyze.py` 계승)**: TTFT·TPOT·throughput 2종(service/arrival window)·achieved_rate·$/Mtok. *정의·공식=CLAUDE §목표 / `LEARNING_NOTES.md §E`.*
 - **인프라(`setup.sh` 계승)**: 좀비청소·chrony(inter-node 타임스탬프 정렬 필수)·수집기(nvidia-smi/ifstat=NIC·DCGM)·S3 sync·TP rank-0만 로깅. *상세=CLAUDE.*
 
@@ -92,12 +92,12 @@
 
 | 기존 (vLLM) | 처리 |
 |---|---|
-| `disagg-exp/sweep.py` | **그대로 재사용** — orchestrator OpenAI 포트(:8000) 조준. Qwen3-4B 토크나이저/`min_tokens`/token-id prompt 호환만 점검 |
+| `disagg-exp/sweep.py` | **오케스트레이션으로 개편** — 부하코어=공식 benchmark_serving 서브프로세스(:8000 조준). 그리드·resume·S3·metadata·warmup·per-side 스냅샷만 담당 |
 | `disagg-exp/analyze.py` | 재사용 + config 리스트·`COST_PER_HR`(g5/g6/g6e 단가) 갱신 |
 | `disagg-exp/setup.sh` | metric collector(nvidia-smi/ifstat/dcgm)·chrony 재사용, 설치단계만 TRT-LLM 컨테이너로 |
 | `launch_configs.sh` | **신규 `launch_trtllm.sh`로 대체** — config+role(context/generation/orchestrator)별 `trtllm-serve` 명령 + YAML 생성. 기존 디스패처 구조 차용 |
 | `disagg_proxy_server.py` | **`trtllm-serve disaggregated`(orchestrator)로 대체** |
-| `instrumented_connector.py` | 대체 — KV전송 시간은 `benchmark_serving`/`/metrics`(beta) 또는 orchestrator 로그 |
+| `instrumented_connector.py` | 대체 — KV전송시간은 orchestrator `/perf_metrics`(→ `perf_*.json`, analyze가 읽음) |
 
 변인 통제 유지(기존 그대로, 명칭만 매핑): prefix/radix cache off, dtype 통일(BF16/FP16), 2-phase warmup/measured, seed, `enable_block_reuse:false`, **TRTLLM attention 백엔드**.
 
@@ -113,7 +113,7 @@
 ## Phase 3 — 검증 (end-to-end)
 
 1. Phase 0 게이트 통과.
-2. Smoke: `launch_trtllm.sh <cfg> {context,generation,orchestrator}` → `/health` → `sweep.py --config test` 1 point `"status":"success"`.
+2. Smoke: `launch_trtllm.sh <cfg> {context,generation,orchestrator}` → `/health` → `sweep.py --config smoke` 1 point → `bench_*.json` 생성(공식 결과).
 3. 비대칭 TP 1 point에서 KV전송/출력정확성 sanity.
 4. small sweep → full sweep (기존 `.done/.failed` resume).
 5. `analyze.py --plot` — TTFT/TPOT/$Mtok + (xPyD, 병렬화 조합)별 비교.

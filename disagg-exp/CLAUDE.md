@@ -53,11 +53,12 @@
 | perf 수집 | disagg YAML `perf_metrics_max_requests:1000` + 워커 `return_perf_metrics:true` → `/perf_metrics`, 측정 후 1회 폴링(저오버헤드, ON 유지) |
 | autotuner | `enable_autotuner` 기본 ON 유지(끄면 성능 저하). 서버 graph/autotuner는 기동 시 자동 웜업 |
 
-### 클라이언트측 (`sweep.py` 계승, OpenAI 호환이라 수정 최소)
-- token-id prompt(list[int])로 `prefill_len` 고정 + `max_tokens=decode_len`·`ignore_eos=true`로 `decode_len` 강제.
-- `stream=true`로 **클라이언트에서 TTFT/E2E 직접 측정** (서버 메트릭은 prefill→전송→decode 전체를 못 봄).
-- Poisson 도착, 동시연결 무제한.
-- **2-phase**: warmup **20**(disagg UCX 첫 연결·스케줄러 ramp 흡수; 서버측 graph/autotuner는 기동 시 자동) → measured **300**(p99 신뢰). **abort/에러율 게이트 제거**(느리거나 실패하는 config도 측정에 남김 — 분석은 status=success 필터). **클라 요청 타임아웃 없음**(서버 `-r` 1800s가 백스톱). smoke 땐 `SWEEP_WARMUP_N=3`. `/health` OK ≠ UCX ready 주의.
+### 클라이언트측 (부하코어 = 공식 `benchmark_serving`, sweep는 오케스트레이션)
+- **부하·측정 = 공식 `benchmark_serving` 서브프로세스**(sweep가 `build_bench_args`로 호출). 손수 짠 aiohttp 제거.
+- ISL/OSL 고정: `--random-ids --tokenize-on-client --random-range-ratio 0.0`(token-id `prompt_token_ids`로 정확) + `--ignore-eos --random-output-len`로 OSL.
+- TTFT/TPOT/ITL/E2EL = 공식 클라측 측정(SSE) → `bench_<point>.json`. **`--percentile-metrics ttft,tpot,itl,e2el` 필수**(아니면 E2EL 누락).
+- Poisson 도착 `--request-rate R --burstiness 1.0`, 동시연결 무제한(`--max-concurrency` 미설정).
+- **2-phase**: warmup **20**(measured 전 소량 `--non-streaming` 호출 — benchmark_serving 내장 warmup 없음, disagg UCX cold-start 흡수) → measured **300**. smoke 땐 `SWEEP_WARMUP_N=3`. abort 게이트 없음(실패 config도 `.failed` 마커만, 분석은 result.json 유무로). `/health` OK ≠ UCX ready 주의.
 
 ### 인프라 (`setup.sh` 계승)
 - 좀비 청소(idempotent), **chrony 시계동기**(inter-node 필수), 수집기 nvidia-smi dmon(1Hz)·ifstat(1Hz, NIC=KV전송 관측)·DCGM, S3 자동 sync, TP rank-0만 로깅.
@@ -101,7 +102,8 @@ generation_servers:
 - **이식(vLLM 계승, 소폭 수정)**: `sweep.py`(MODEL_NAME→Qwen3-4B, metadata 토폴로지, **+perf_metrics 폴링·SWEEP_PD_PAIRS·WARMUP 20**), `analyze.py`(COST_PER_HR g5/g6/g6e, T1~T4, **+KV전송시간 분석**), `setup.sh`(컨테이너 모델, 수집기 보존). ← 원본 `../vllm-disaggregation/disagg-exp/`.
 - **도구 추가(2026-06-10, 소스 검증)**: KV전송 계측(`/perf_metrics`→`perf_*.json`→analyze KV컬럼), 디버그 토글(`launch_trtllm.sh` `LOG_LEVEL`+env 인라인주석, `DEBUGGING.md`), smoke(`SWEEP_PD_PAIRS`+적은요청), 웜업(20, 서버/클라 구분), **CUDA graph OFF**. vLLM의 `instrumented_connector.py`는 TRT-LLM 네이티브 `/perf_metrics`로 대체(더 풍부).
 - **신규(Claude 작성, v1.2.1 소스 검증)**: `launch_trtllm.sh`(role별 trtllm-serve + disagg YAML 런타임 생성), `ctx_extra_llm_api_options.yaml`·`gen_extra_llm_api_options.yaml`(워커 변인통제), `disagg_config.yaml`(1P1D 정적 템플릿), `trtllm_support_matrix.md`(Phase0 게이트).
-- **per-side 측정(2026-06-10, 9-에이전트 소스 전수조사+적대적 검증)**: `prom_scrape.py`(orchestrator `/prometheus/metrics`의 `ctx_/gen_completed_requests_total`를 measured 윈도우 전/후 차분=prefill/decode RPS) → sweep `prom_*.json` → analyze `pf_rps/dc_rps/pf_tps/dc_tps`. **per-side TPS는 공식 토큰 카운터 부재**(collector.py 토큰카운터 0)로 `RPS×고정길이` 파생. **전체 TTFT/TPOT/throughput/latency는 sweep이 이미 측정**(공식 `benchmark_serving`과 정의 동일 — 부하코어 교체 불필요, 선택적 교차검증만). 상세·근거=`병렬화-KV전송-측정.md §6/§7`.
+- **부하코어 = 공식 `benchmark_serving` (2026-06-11 교체 완료)**: sweep.py가 포인트마다 `tensorrt_llm.serve.scripts.benchmark_serving`을 서브프로세스로 호출(warmup `--non-streaming` → measured `--save-result --save-detailed`) → `bench_<point>.json`. **전체 TTFT/TPOT/ITL/E2EL/throughput = 공식 집계 그대로**(analyze가 읽기만). 손수 짠 aiohttp 부하 제거. sweep=오케스트레이션(그리드·resume·S3·metadata·warmup·per-side 스냅샷)만.
+- **per-side 측정(커스텀 — 공식 불가)**: `prom_scrape.py`(orchestrator `/prometheus/metrics`의 `ctx_/gen_completed_requests_total`를 measured 윈도우 전/후 차분=prefill/decode RPS) → `prom_*.json` → analyze `pf_rps/dc_rps/pf_tps/dc_tps`. **per-side TPS는 공식 토큰 카운터 부재**(collector.py 토큰카운터 0)로 `RPS×고정길이` 파생. 9-에이전트 소스 전수조사+적대적 검증. 상세·근거=`병렬화-KV전송-측정.md §6/§7`.
 - **대체됨**: `launch_configs.sh`→`launch_trtllm.sh`, `disagg_proxy_server.py`→`trtllm-serve disaggregated`, `instrumented_connector.py`→(KV전송시간은 orchestrator `/perf_metrics`).
 - **코드 검증**: 적대적 워크플로우로 v1.2.1 소스 대조 → blocker 0. 빈배열 가드(bash<4.4 이식성) 등 minor 픽스 반영. 로컬 정적검사(bash -n / py_compile / yaml) 통과. **런타임 검증은 원격 GPU Phase 0에서.**
 - **문서 (8종, 역할 분리 — "한 사실은 한 문서에", 중복 금지)**. 실험 중 무엇을 열지 한눈에:

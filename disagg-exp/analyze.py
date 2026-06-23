@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Post-experiment analysis for disagg-exp tier-1.
+Post-experiment analysis for disagg-exp.
 
 Usage:
-    python analyze.py --log-dir ./results [--configs A B C D] [--plot]
+    python analyze.py --log-dir ./results [--configs T1 T2 ...] [--plot]
 
-Reads per-request JSONL files from $LOG_DIR/<config>/<point>.jsonl.
-Prints a table and optionally saves matplotlib figures.
+각 포인트의 메트릭은 **공식 benchmark_serving 결과(`bench_<point>.json`)**에서 읽고,
+per-side(prefill/decode) RPS·TPS는 `prom_<point>.json`, KV전송시간은 `perf_<point>.json`에서 병합한다.
+(전체 TTFT/TPOT/ITL/E2EL/throughput = 공식 집계 그대로. 우리가 다시 계산하지 않음.)
 """
 
 import argparse
@@ -37,37 +38,14 @@ _INSTANCE_HR = {
 }
 # config 라벨별 총 $/hr = 그 config가 점유한 인스턴스 합.
 # ⚠️ 키는 sweep.py --config 라벨과 글자단위 일치해야 함(불일치 시 $/Mtok=NaN).
-# ⚠️ 아래는 "단일 4-GPU 박스(intra)" 가정 placeholder — 최종 인스턴스/노드수 확정 후 조정.
+# ⚠️ 아래는 placeholder — 최종 인스턴스/노드수 확정 후 조정.
 #    inter-node 1P1D면 2개 인스턴스 합으로, 1P3D면 점유 인스턴스 수만큼 합산.
 COST_PER_HR = {
-    "T1": _INSTANCE_HR["g6.12xlarge"],   # inter 1P1D 베이스라인 — 실제 노드수/인스턴스로 조정
-    "T2": _INSTANCE_HR["g6.12xlarge"],   # 1P3D
-    "T3": _INSTANCE_HR["g6.12xlarge"],   # 비대칭 TP/PP
-    "T4": _INSTANCE_HR["g6.12xlarge"],   # intra 반복
+    "T1": _INSTANCE_HR["g6.xlarge"] * 2,   # inter 1P1D 베이스라인 (prefill + decode 노드)
+    "T2": _INSTANCE_HR["g6.12xlarge"],     # 1P3D — 실제 점유로 조정
+    "T3": _INSTANCE_HR["g6.12xlarge"],     # 비대칭 TP/PP
+    "T4": _INSTANCE_HR["g6.12xlarge"],     # intra 반복
 }
-
-
-def load_points(log_dir: Path, config: str) -> dict:
-    """Returns dict: point_id → list[dict] (measured phase only)."""
-    config_dir = log_dir / config
-    if not config_dir.exists():
-        return {}
-    points = {}
-    for jsonl in sorted(config_dir.glob("*.jsonl")):
-        rows = []
-        with open(jsonl) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-        measured = [r for r in rows if r.get("phase") == "measured"]
-        if measured:
-            points[jsonl.stem] = measured
-    return points
 
 
 def _p(arr: list[float], pct: float) -> float:
@@ -76,59 +54,75 @@ def _p(arr: list[float], pct: float) -> float:
     return float(np.percentile(arr, pct))
 
 
-def _warn_pt_delta(rows: list[dict], point_id: str) -> None:
-    """Warn if prompt_tokens deviates from prefill_len by more than 1."""
-    prefill_len = rows[0].get("prefill_len", 0)
-    pts = [r["prompt_tokens"] for r in rows if r.get("prompt_tokens") is not None]
-    if not pts:
-        return
-    deltas = [abs(p - prefill_len) for p in pts]
-    bad = [d for d in deltas if d > 1]
-    if bad:
-        print(
-            f"  WARN [{point_id}]: {len(bad)}/{len(pts)} requests have"
-            f" |prompt_tokens - prefill_len| > 1 (max={max(bad)})"
-        )
+def _num(v) -> float:
+    """None/비수치 → NaN (플롯·포맷 안전)."""
+    return float(v) if isinstance(v, (int, float)) and v == v else float("nan")
 
 
-def analyze_point(rows: list[dict]) -> dict:
-    ok = [r for r in rows if r.get("status") == "success"]
-    if not ok:
+def _fmt(v, width: int, prec: int = 1) -> str:
+    """수치면 폭/정밀도 맞춰 포맷, 아니면 'n/a'."""
+    return f"{v:>{width}.{prec}f}" if isinstance(v, (int, float)) and v == v else f"{'n/a':>{width}}"
+
+
+def parse_point_id(point_id: str) -> tuple[int, int, float]:
+    """p{prefill}_d{decode}_r{rate} → (prefill, decode, rate)."""
+    parts = point_id.split("_")
+    return int(parts[0][1:]), int(parts[1][1:]), float(parts[2][1:])
+
+
+def list_points(config_dir: Path) -> list[str]:
+    """config 디렉토리의 bench_<point>.json들에서 point_id 목록 추출."""
+    if not config_dir.exists():
+        return []
+    return sorted(p.stem[len("bench_"):] for p in config_dir.glob("bench_*.json"))
+
+
+def load_bench(config_dir: Path, point_id: str) -> dict:
+    """bench_{point_id}.json (공식 benchmark_serving --save-result)에서 집계 메트릭을 읽음.
+    percentile 키는 sweep가 넘긴 --metric-percentiles(50,99) 기준(p50_*_ms / p99_*_ms).
+    파일 없음/깨짐/실패면 {'n_ok':0} → 표에 NO DATA."""
+    bf = config_dir / f"bench_{point_id}.json"
+    if not bf.exists():
         return {"n_ok": 0}
-
-    ttfts  = [r["ttft_s"] for r in ok if r.get("ttft_s") is not None]
-    e2es   = [r["e2e_s"]  for r in ok if r.get("e2e_s")  is not None]
-    comp_t = [r["completion_tokens"] for r in ok if r.get("completion_tokens")]
-    decode_len = ok[0].get("decode_len", 1)
-    rate   = ok[0].get("rate", 1.0)
-
-    # TPOT: (e2e - ttft) / (completion_tokens - 1), per request, then aggregate
-    tpots = []
-    for r in ok:
-        if r.get("ttft_s") and r.get("e2e_s") and r.get("completion_tokens", 1) > 1:
-            tpots.append((r["e2e_s"] - r["ttft_s"]) / (r["completion_tokens"] - 1))
-
-    # Throughput: two definitions
-    sends = [r["send_ts"] for r in ok]
-    recvs = [r["send_ts"] + r["e2e_s"] for r in ok if r.get("e2e_s")]
-    total_tok = sum(comp_t) + sum(r.get("prompt_tokens", 0) for r in ok)
-
-    thr_e2e  = total_tok / (max(recvs) - min(sends)) if recvs else float("nan")
-    thr_send = total_tok / (max(sends) - min(sends)) if len(sends) > 1 else float("nan")
-    achieved_rate = len(ok) / ((max(sends) - min(sends)) or 1)
-
+    try:
+        d = json.loads(bf.read_text())
+    except Exception:
+        return {"n_ok": 0}
+    if not isinstance(d, dict):
+        return {"n_ok": 0}
+    completed = d.get("completed", 0) or 0
+    num_prompts = d.get("num_prompts", 0) or 0
+    fail_rate = (1.0 - completed / num_prompts) if num_prompts else float("nan")
+    in_lens = d.get("input_lens") or []     # --save-detailed일 때만 존재
+    out_lens = d.get("output_lens") or []
+    mean_in = (sum(in_lens) / len(in_lens)) if in_lens else None
+    mean_out = (sum(out_lens) / len(out_lens)) if out_lens else None
     return {
-        "n_ok": len(ok),
-        "n_total": len(rows),
-        "fail_rate": 1.0 - len(ok) / len(rows),
-        "ttft_p50_ms": _p(ttfts, 50) * 1000,
-        "ttft_p99_ms": _p(ttfts, 99) * 1000,
-        "tpot_p50_ms": _p(tpots, 50) * 1000,
-        "tpot_p99_ms": _p(tpots, 99) * 1000,
-        "thr_tok_s_e2e":  thr_e2e,
-        "thr_tok_s_send": thr_send,
-        "achieved_rate":  achieved_rate,
+        "n_ok": completed,
+        "num_prompts": num_prompts,
+        "fail_rate": fail_rate,
+        "ttft_p50_ms": d.get("p50_ttft_ms"),
+        "ttft_p99_ms": d.get("p99_ttft_ms"),
+        "tpot_p50_ms": d.get("p50_tpot_ms"),
+        "tpot_p99_ms": d.get("p99_tpot_ms"),
+        "itl_p99_ms":  d.get("p99_itl_ms"),
+        "e2el_p99_ms": d.get("p99_e2el_ms"),
+        "out_tok_s":   d.get("output_throughput"),
+        "req_s":       d.get("request_throughput"),
+        "total_tok_s": d.get("total_token_throughput"),
+        "mean_input_len":  mean_in,
+        "mean_output_len": mean_out,
     }
+
+
+def _warn_pt_delta(point_id: str, bench: dict) -> None:
+    """benchmark_serving이 실측한 평균 입력길이가 목표 prefill_len과 >1 어긋나면 경고(--save-detailed 필요)."""
+    mean_in = bench.get("mean_input_len")
+    if mean_in is None:
+        return
+    pl, _, _ = parse_point_id(point_id)
+    if abs(mean_in - pl) > 1:
+        print(f"  WARN [{point_id}]: mean input_len {mean_in:.1f} != prefill_len {pl}")
 
 
 def load_perf(config_dir: Path, point_id: str) -> dict:
@@ -167,14 +161,12 @@ def load_perf(config_dir: Path, point_id: str) -> dict:
     return out
 
 
-def load_prom(config_dir: Path, point_id: str, rows: list[dict]) -> dict:
-    """prom_{point_id}.json (orchestrator /prometheus/metrics measured-윈도우 전/후 스냅샷)에서
-    per-side RPS를 계산하고, 강제된 토큰길이로 per-side TPS를 파생.
-
-    - prefill_rps = (ctx_after − ctx_before) / window_s,  decode_rps = (gen_after − gen_before)/window_s
-      (ctx_/gen_completed_requests_total, prom_scrape.py 참조)
+def load_prom(config_dir: Path, point_id: str, mean_pt: float | None, mean_ct: float | None) -> dict:
+    """prom_{point_id}.json (measured-윈도우 전/후 스냅샷)에서 per-side RPS를 계산하고,
+    강제된 토큰길이(mean_pt/mean_ct)로 per-side TPS를 파생.
+    - prefill_rps = (ctx_after − ctx_before)/window_s, decode_rps = (gen_after − gen_before)/window_s
+      (ctx_/gen_completed_requests_total — prom_scrape.py 참조)
     - per-side TPS는 공식 토큰 카운터가 없어(병렬화-KV전송-측정.md §6) RPS × 토큰수로 파생.
-      토큰수 = 실측 mean(prompt/completion_tokens), 없으면 강제 목표 prefill_len/decode_len 폴백.
     파일 없으면(=스크레이프 비활성/orchestrator 미노출) 빈 dict → 표에 'n/a'."""
     pf = config_dir / f"prom_{point_id}.json"
     if not pf.exists():
@@ -202,12 +194,6 @@ def load_prom(config_dir: Path, point_id: str, rows: list[dict]) -> dict:
 
     pf_rps, dc_rps = _rps("ctx"), _rps("gen")
 
-    ok = [r for r in rows if r.get("status") == "success"]
-    pts = [r["prompt_tokens"] for r in ok if r.get("prompt_tokens")]
-    cts = [r["completion_tokens"] for r in ok if r.get("completion_tokens")]
-    mean_pt = (sum(pts) / len(pts)) if pts else (ok[0].get("prefill_len") if ok else None)
-    mean_ct = (sum(cts) / len(cts)) if cts else (ok[0].get("decode_len") if ok else None)
-
     out: dict = {}
     if pf_rps is not None:
         out["prefill_rps"] = pf_rps
@@ -221,23 +207,21 @@ def load_prom(config_dir: Path, point_id: str, rows: list[dict]) -> dict:
 
 
 def dollar_per_m_tokens(stats: dict, config: str) -> float:
-    """$/M output tokens using e2e throughput and on-demand price."""
-    thr = stats.get("thr_tok_s_e2e", 0)
+    """$/M output tokens using official output_throughput and on-demand price."""
+    thr = stats.get("out_tok_s")
     if not thr or thr != thr:
         return float("nan")
     cost_hr = COST_PER_HR.get(config, float("nan"))
-    # tokens/s → M tokens/hr → $/M tokens
-    m_tok_hr = thr * 3600 / 1e6
+    m_tok_hr = thr * 3600 / 1e6   # tokens/s → M tokens/hr
     return cost_hr / m_tok_hr if m_tok_hr else float("nan")
 
 
 def print_table(all_stats: dict[str, dict[str, dict]]) -> None:
     header = (
-        f"{'config':<8} {'point':<32} {'n_ok':>6} {'fail%':>6}"
-        f" {'ttft_p50ms':>11} {'ttft_p99ms':>11}"
-        f" {'tpot_p50ms':>11} {'tpot_p99ms':>11}"
-        f" {'thr_e2e':>9} {'$/Mtok':>8} {'kv_p50ms':>9} {'kv_p99ms':>9}"
-        f" {'pf_rps':>7} {'dc_rps':>7} {'pf_tps':>8} {'dc_tps':>8}"
+        f"{'config':<8} {'point':<28} {'n_ok':>6} {'fail%':>6}"
+        f" {'ttft_p50':>9} {'ttft_p99':>9} {'tpot_p50':>9} {'tpot_p99':>9}"
+        f" {'itl_p99':>8} {'e2el_p99':>9} {'out_tok/s':>10} {'$/Mtok':>8}"
+        f" {'kv_p50':>8} {'kv_p99':>8} {'pf_rps':>7} {'dc_rps':>7} {'pf_tps':>8} {'dc_tps':>8}"
     )
     print(header)
     print("-" * len(header))
@@ -246,83 +230,58 @@ def print_table(all_stats: dict[str, dict[str, dict]]) -> None:
         for point_id in sorted(all_stats[config]):
             s = all_stats[config][point_id]
             if s.get("n_ok", 0) == 0:
-                print(f"{config:<8} {point_id:<32} {'NO DATA':>6}")
+                print(f"{config:<8} {point_id:<28} {'NO DATA':>6}")
                 continue
             dpm = dollar_per_m_tokens(s, config)
-            kv50 = s.get("kv_transfer_p50_ms")
-            kv99 = s.get("kv_transfer_p99_ms")
-            kv50s = f"{kv50:>9.2f}" if kv50 is not None else f"{'n/a':>9}"
-            kv99s = f"{kv99:>9.2f}" if kv99 is not None else f"{'n/a':>9}"
-            pf_rps = s.get("prefill_rps"); dc_rps = s.get("decode_rps")
-            pf_tps = s.get("prefill_tps"); dc_tps = s.get("decode_tps")
-            pf_rs = f"{pf_rps:>7.2f}" if pf_rps is not None else f"{'n/a':>7}"
-            dc_rs = f"{dc_rps:>7.2f}" if dc_rps is not None else f"{'n/a':>7}"
-            pf_ts = f"{pf_tps:>8.0f}" if pf_tps is not None else f"{'n/a':>8}"
-            dc_ts = f"{dc_tps:>8.0f}" if dc_tps is not None else f"{'n/a':>8}"
+            fail_pct = s.get("fail_rate")
+            fail_s = f"{fail_pct*100:>5.1f}%" if isinstance(fail_pct, (int, float)) and fail_pct == fail_pct else f"{'n/a':>6}"
             print(
-                f"{config:<8} {point_id:<32} {s['n_ok']:>6} {s['fail_rate']*100:>5.1f}%"
-                f" {s['ttft_p50_ms']:>11.1f} {s['ttft_p99_ms']:>11.1f}"
-                f" {s['tpot_p50_ms']:>11.1f} {s['tpot_p99_ms']:>11.1f}"
-                f" {s['thr_tok_s_e2e']:>9.1f} {dpm:>8.3f} {kv50s} {kv99s}"
-                f" {pf_rs} {dc_rs} {pf_ts} {dc_ts}"
+                f"{config:<8} {point_id:<28} {s['n_ok']:>6} {fail_s}"
+                f" {_fmt(s.get('ttft_p50_ms'),9)} {_fmt(s.get('ttft_p99_ms'),9)}"
+                f" {_fmt(s.get('tpot_p50_ms'),9)} {_fmt(s.get('tpot_p99_ms'),9)}"
+                f" {_fmt(s.get('itl_p99_ms'),8)} {_fmt(s.get('e2el_p99_ms'),9)}"
+                f" {_fmt(s.get('out_tok_s'),10)} {_fmt(dpm,8,3)}"
+                f" {_fmt(s.get('kv_transfer_p50_ms'),8,2)} {_fmt(s.get('kv_transfer_p99_ms'),8,2)}"
+                f" {_fmt(s.get('prefill_rps'),7,2)} {_fmt(s.get('decode_rps'),7,2)}"
+                f" {_fmt(s.get('prefill_tps'),8,0)} {_fmt(s.get('decode_tps'),8,0)}"
             )
 
 
 def plot_comparison(all_stats: dict[str, dict[str, dict]], out_dir: Path) -> None:
-    """One plot per (prefill_len, decode_len) pair: TTFT p50 vs rate for all configs."""
+    """One plot per (prefill_len, decode_len) pair: TTFT/TPOT/$ vs rate for all configs."""
     if not HAS_MPLOT:
         print("matplotlib not available, skipping plots")
         return
 
-    # Collect (prefill, decode, rate) → config → stats
-    by_pd: dict[tuple, dict[str, dict]] = defaultdict(dict)
+    by_pd: dict[tuple, dict[str, list]] = defaultdict(dict)
     for config, points in all_stats.items():
         for point_id, s in points.items():
-            # point_id: p{prefill}_d{decode}_r{rate}
             try:
-                parts = point_id.split("_")
-                pl = int(parts[0][1:])
-                dl = int(parts[1][1:])
-                r  = float(parts[2][1:])
+                pl, dl, r = parse_point_id(point_id)
             except Exception:
                 continue
-            by_pd[(pl, dl)][f"{config}_{r}"] = s
-            by_pd[(pl, dl)][config] = by_pd[(pl, dl)].get(config, {})
-            # store as list for plotting
-            if not isinstance(by_pd[(pl, dl)].get(config), list):
-                by_pd[(pl, dl)][config] = []
-            by_pd[(pl, dl)][config].append((r, s))
+            by_pd[(pl, dl)].setdefault(config, []).append((r, s))
 
     for (pl, dl), config_data in by_pd.items():
         fig, axes = plt.subplots(1, 3, figsize=(15, 4))
         fig.suptitle(f"prefill={pl} decode={dl}")
 
         for config, rate_stats in sorted(config_data.items()):
-            if not isinstance(rate_stats, list):
-                continue
             rate_stats.sort(key=lambda x: x[0])
-            rates = [x[0] for x in rate_stats]
-            ttft50 = [x[1].get("ttft_p50_ms", float("nan")) for x in rate_stats]
-            ttft99 = [x[1].get("ttft_p99_ms", float("nan")) for x in rate_stats]
-            tpot50 = [x[1].get("tpot_p50_ms", float("nan")) for x in rate_stats]
-            dpm = [dollar_per_m_tokens(x[1], config) for x in rate_stats]
+            rates  = [x[0] for x in rate_stats]
+            ttft50 = [_num(x[1].get("ttft_p50_ms")) for x in rate_stats]
+            ttft99 = [_num(x[1].get("ttft_p99_ms")) for x in rate_stats]
+            tpot50 = [_num(x[1].get("tpot_p50_ms")) for x in rate_stats]
+            dpm    = [_num(dollar_per_m_tokens(x[1], config)) for x in rate_stats]
 
             axes[0].plot(rates, ttft50, marker="o", label=f"{config} p50")
             axes[0].plot(rates, ttft99, marker="x", linestyle="--", label=f"{config} p99")
             axes[1].plot(rates, tpot50, marker="o", label=config)
             axes[2].plot(rates, dpm, marker="o", label=config)
 
-        axes[0].set_title("TTFT (ms)")
-        axes[0].set_xlabel("rate (req/s)")
-        axes[0].legend(fontsize=7)
-
-        axes[1].set_title("TPOT p50 (ms/tok)")
-        axes[1].set_xlabel("rate (req/s)")
-        axes[1].legend(fontsize=7)
-
-        axes[2].set_title("$/M tokens (OD)")
-        axes[2].set_xlabel("rate (req/s)")
-        axes[2].legend(fontsize=7)
+        axes[0].set_title("TTFT (ms)");        axes[0].set_xlabel("rate (req/s)"); axes[0].legend(fontsize=7)
+        axes[1].set_title("TPOT p50 (ms/tok)"); axes[1].set_xlabel("rate (req/s)"); axes[1].legend(fontsize=7)
+        axes[2].set_title("$/M tokens (OD)");   axes[2].set_xlabel("rate (req/s)"); axes[2].legend(fontsize=7)
 
         fig.tight_layout()
         fname = out_dir / f"plot_p{pl}_d{dl}.png"
@@ -337,16 +296,21 @@ def main(args: argparse.Namespace) -> None:
 
     all_stats: dict[str, dict[str, dict]] = {}
     for config in configs:
-        points = load_points(log_dir, config)
-        if not points:
-            print(f"[analyze] no data for config {config} in {log_dir / config}")
+        config_dir = log_dir / config
+        point_ids = list_points(config_dir)
+        if not point_ids:
+            print(f"[analyze] no data for config {config} in {config_dir}")
             continue
         all_stats[config] = {}
-        for point_id, rows in sorted(points.items()):
-            _warn_pt_delta(rows, point_id)
-            s = analyze_point(rows)
-            s.update(load_perf(log_dir / config, point_id))          # KV전송시간 등 perf 병합(있으면)
-            s.update(load_prom(log_dir / config, point_id, rows))    # per-side RPS/TPS 병합(있으면)
+        for point_id in point_ids:
+            b = load_bench(config_dir, point_id)
+            _warn_pt_delta(point_id, b)
+            pl, dl, _ = parse_point_id(point_id)
+            mean_pt = b.get("mean_input_len") or pl     # --save-detailed 없으면 목표 길이로 폴백
+            mean_ct = b.get("mean_output_len") or dl
+            s = dict(b)
+            s.update(load_perf(config_dir, point_id))                       # KV전송시간 (있으면)
+            s.update(load_prom(config_dir, point_id, mean_pt, mean_ct))     # per-side RPS/TPS (있으면)
             all_stats[config][point_id] = s
 
     if not all_stats:

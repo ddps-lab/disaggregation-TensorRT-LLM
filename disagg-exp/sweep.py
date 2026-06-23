@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """
-Client workload driver for disagg-exp tier-1.
+Workload orchestrator for disagg-exp.
+
+부하생성·측정은 공식 `tensorrt_llm.serve.scripts.benchmark_serving`이 담당하고,
+이 스크립트는 그 위의 오케스트레이션(그리드·resume·S3·metadata·per-side 스냅샷)만 한다.
+즉 "공식 벤치를 최대한, 꼭 필요한 것만 커스텀" — 손수 짠 aiohttp 부하 코드는 제거됨.
 
 Usage:
-    python sweep.py --config A --base-url http://localhost:8000
+    python sweep.py --config T1 --base-url http://localhost:8000
 
 Env overrides for the grid:
-    SWEEP_PREFILL_LENS=512,2048,8192
-    SWEEP_DECODE_LENS=128,512,1024,4096
-    SWEEP_RATES=0.5,1.0,2.0
+    SWEEP_PD_PAIRS="2048,128;1024,512"   # (prefill,decode) 쌍들 (';'/',' 구분)
+    SWEEP_RATES=0.5,1.0,2.0              # 초당 요청 수(QPS)
+    SWEEP_WARMUP_N=20  SWEEP_MEASURED_N=300
 
 S3 sync (embedded — runs as a background thread while sweep is active):
     S3_BUCKET=hdjung-disaggregation-result   # default if --s3-bucket omitted
     S3_SYNC_INTERVAL=30                       # seconds between syncs
     --s3-bucket ""                            # disable
 
-Each completed sweep point writes a JSONL file:
-    $EXP_LOG_DIR/<config>/<point_id>.jsonl
+각 포인트가 남기는 산출물 ($EXP_LOG_DIR/<config>/):
+    bench_<point_id>.json   # benchmark_serving --save-result (TTFT/TPOT/ITL/E2EL/throughput)
+    prom_<point_id>.json    # per-side 카운터 스냅샷 (prefill/decode RPS 산출용)
+    perf_<point_id>.json    # /perf_metrics (KV전송시간)
 """
 
 import argparse
@@ -25,14 +31,12 @@ import atexit
 import datetime as _dt
 import json
 import os
-import random
 import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, asdict
 from pathlib import Path
 
 import aiohttp
@@ -40,9 +44,7 @@ import aiohttp
 import prom_scrape   # per-side(prefill/decode) RPS 스크레이퍼 — 공식이 못 주는 유일한 커스텀 조각
 
 # ── grid (실험 조건표) ────────────────────────────────────────────────────────
-# 벤치마크에서 테스트할 조건들을 정의합니다.
-# 환경변수로 오버라이드 가능하며, 기본값은 아래와 같습니다.
-# 이 조합들의 교차곱(Cross Product)이 실험의 전체 Grid를 구성합니다.
+# 환경변수로 오버라이드 가능하며, (prefill,decode)×rate 교차곱이 전체 Grid를 구성합니다.
 
 # [헬퍼] 환경변수에서 콤마 구분 텍스트를 파이썬 리스트로 변환 (예: "1.0,4.0" -> [1.0, 4.0])
 def _parse_list(env_key: str, default: list[float]) -> list[float]:
@@ -72,194 +74,135 @@ RATES        = _parse_list("SWEEP_RATES", [1.0, 2.0, 4.0])  # 초당 요청 수 
 
 # warmup(버림): disagg는 첫 KV전송에서 UCX 연결이 lazy 수립되므로 넉넉히 20. (서버측 CUDA graph/autotuner는
 #   trtllm-serve 기동 시 자동 웜업 → 클라 웜업은 UCX·스케줄러 ramp 흡수용.) smoke 땐 SWEEP_WARMUP_N=3.
+#   benchmark_serving엔 내장 warmup이 없어, measured 전에 소량 non-streaming 호출로 우리가 흡수한다.
 WARMUP_N   = int(os.environ.get("SWEEP_WARMUP_N",   "20"))   # 준비운동 요청 수
 MEASURED_N = int(os.environ.get("SWEEP_MEASURED_N", "300"))  # 실전 측정 요청 수
 
 LOG_DIR = os.environ.get("EXP_LOG_DIR", "./results")  # 모든 결과 파일의 저장 경로
 
-MODEL_NAME = "Qwen/Qwen3-4B"  # TRT-LLM은 model을 검증 안 하지만(positional, --served-model-name 없음),
-#                               launch_trtllm.sh의 MODEL(=Qwen/Qwen3-4B)과 표기 일치시켜 일관성 유지
+MODEL_NAME = os.environ.get("MODEL", "Qwen/Qwen3-4B")  # launch_trtllm.sh의 MODEL과 일치(benchmark_serving --model)
 
 
-# ── request (요청 1개의 측정 결과를 담는 데이터 구조) ─────────────────────────
-# JSONL 파일에 저장될 때 이 필드들이 그대로 JSON 키가 됩니다.
-@dataclass
-class Result:
-    req_id: str
-    phase: str          # "warmup"(준비운동) | "measured"(실전 데이터)
-    prefill_len: int    # 요청한 질문 길이
-    decode_len: int     # 요청한 답변 길이
-    rate: float         # 목표 QPS
-    send_ts: float      # 요청을 보낸 정확한 시각 (처리량 계산용)
-    ttft_s: float | None       # 첫 토큰 도착 시간 (초) — 핵심 메트릭
-    e2e_s: float | None        # 전체 응답 완료 시간 (초)
-    prompt_tokens: int | None  # 서버가 실제 처리한 질문 토큰 수 (검증용)
-    completion_tokens: int | None  # 서버가 실제 생성한 답변 토큰 수
-    status: str         # "success" | "error" | "timeout"
-    error: str | None
+# ── 공식 부하 도구 (benchmark_serving) 호출 ────────────────────────────────────
+# 부하생성·측정은 공식 tensorrt_llm.serve.scripts.benchmark_serving이 담당(손수 짠 aiohttp 대체).
+#   - 토큰-id ISL 고정: --random-ids --tokenize-on-client --random-range-ratio 0 → prompt_token_ids로 정확
+#   - OSL 고정: --ignore-eos --random-output-len
+#   - Poisson 도착: --request-rate R --burstiness 1.0
+#   - TTFT/TPOT/ITL/E2EL/throughput을 result.json에 저장(--save-result --save-detailed).
+#     ⚠️ E2EL은 --percentile-metrics에 e2el을 명시해야 나옴(benchmark_serving.py:537-539).
+#   내장 warmup 없음 → measured 전에 소량 non-streaming 호출로 disagg UCX cold-start 흡수.
+BENCH_MODULE = "tensorrt_llm.serve.scripts.benchmark_serving"
 
 
-# ── 클라이언트 초시계 (API 요청 1개의 TTFT/E2E 측정) ────────────────────────
-# 클라이언트에서 SSE로 직접 측정 = 사용자 체감 지연(client→orchestrator 네트워크 포함), 프레임워크 무관·견고.
-#   (TRT-LLM orchestrator /perf_metrics도 disagg 전체 파이프라인 TTFT·KV전송시간을 제공 → analyze가 보완 사용.
-#    단 클라 측정을 1차로 유지: perf 활성 여부에 의존 안 하고, 실제 체감 지연을 잼.)
-# 원리: stream=True면 토큰 생성마다 한 줄씩 옴 → 첫 줄 도착=TTFT, 마지막 줄=E2E.
-async def _do_request(
-    session: aiohttp.ClientSession,
+def _split_host_port(base_url: str) -> tuple[str, int]:
+    """http://host:port/... → (host, port). 포트 없으면 8000."""
+    netloc = base_url.split("://", 1)[-1].split("/", 1)[0]
+    if ":" in netloc:
+        host, port = netloc.rsplit(":", 1)
+        return host, int(port)
+    return netloc, 8000
+
+
+def build_bench_args(
     base_url: str,
-    req_id: str,
-    phase: str,
     prefill_len: int,
     decode_len: int,
     rate: float,
-) -> Result:
-    # 토큰 ID를 직접 넣어서 정확히 prefill_len개의 입력을 보장 (문장 토크나이징 불확실성 제거)
-    # 1부터 시작: 0번은 특수 토큰(BOS/PAD)이라 예상치 못한 동작 방지
-    prompt_ids = list(range(1, prefill_len + 1))
-
-    payload = {
-        "model": MODEL_NAME,
-        "prompt": prompt_ids,        # 토큰 ID 리스트로 직접 전달 (문자열 아님)
-        "max_tokens": decode_len,    # 최대 생성 길이
-        "temperature": 0,            # 결정론적 생성 (재현성)
-        "top_p": 1.0,
-        "ignore_eos": True,          # EOS 토큰이 나와도 멈추지 않고 끝까지 생성
-        "stream": True,              # SSE 스트리밍 활성화 (TTFT 측정의 핵심)
-        "stream_options": {"include_usage": True},  # 마지막 청크에 토큰 수 포함
-    }
-
-    send_ts = time.time()  # ① 스톱워치 시작
-    ttft_s: float | None = None
-    e2e_s: float | None = None
-    prompt_tokens: int | None = None
-    completion_tokens: int | None = None
-
-    try:
-        # ② 서버에 HTTP POST 요청 전송 (스트리밍 연결 열기)
-        # 클라 타임아웃 없음(total=None) — 느린/막힌 요청을 인위로 자르지 않고 끝까지 잰다.
-        #   백스톱: orchestrator -r REQUEST_TIMEOUT(기본 1800s)가 서버측에서 바운드.
-        async with session.post(
-            f"{base_url}/v1/completions",
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=None),
-        ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                return Result(req_id, phase, prefill_len, decode_len, rate,
-                               send_ts, None, None, None, None,
-                               "error", f"http_{resp.status}: {body[:200]}")
-
-            # ③ SSE 스트리밍: 서버가 토큰을 생성할 때마다 한 줄씩 실시간으로 도착
-            got_first = False
-            async for raw_line in resp.content:  # 한 줄 올 때마다 깨어남
-                line = raw_line.decode().strip()
-                if not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":  # 서버가 "끝!" 신호를 보냄
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-
-                # ④ 첫 토큰 도착 → TTFT 측정 (딱 한 번만 실행됨)
-                if not got_first:
-                    choices = chunk.get("choices", [])
-                    if choices and choices[0].get("text", ""):
-                        ttft_s = time.time() - send_ts
-                        got_first = True
-
-                # 마지막 청크에 들어있는 토큰 사용량 정보 수집
-                usage = chunk.get("usage")
-                if usage:
-                    prompt_tokens = usage.get("prompt_tokens")
-                    completion_tokens = usage.get("completion_tokens")
-
-            e2e_s = time.time() - send_ts  # ⑤ 마지막 토큰까지 도착 → E2E 측정
-
-    except asyncio.TimeoutError:
-        return Result(req_id, phase, prefill_len, decode_len, rate,
-                       send_ts, None, None, None, None, "timeout", "timeout")
-    except Exception as exc:
-        return Result(req_id, phase, prefill_len, decode_len, rate,
-                       send_ts, None, None, None, None, "error", str(exc)[:200])
-
-    return Result(req_id, phase, prefill_len, decode_len, rate,
-                   send_ts, ttft_s, e2e_s, prompt_tokens, completion_tokens,
-                   "success", None)
+    n: int,
+    result_dir: Path | None,
+    result_filename: str | None,
+    streaming: bool,
+) -> list[str]:
+    """benchmark_serving CLI 인자 생성. result_dir 지정 시 --save-result(+--save-detailed)."""
+    host, port = _split_host_port(base_url)
+    args = [
+        "--model", MODEL_NAME,
+        "--backend", "openai",
+        "--host", host,
+        "--port", str(port),
+        "--endpoint", "/v1/completions",
+        "--dataset-name", "random",
+        "--random-ids",                 # 토큰-id 직접 생성(정확한 ISL)
+        "--tokenize-on-client",         # 서버엔 prompt_token_ids로 전달
+        "--random-input-len", str(prefill_len),
+        "--random-output-len", str(decode_len),
+        "--random-range-ratio", "0.0",  # 길이 분산 0(고정)
+        "--ignore-eos",                 # OSL 강제
+        "--num-prompts", str(n),
+        "--request-rate", str(rate),
+        "--burstiness", "1.0",          # 1.0 = Poisson
+    ]
+    if not streaming:
+        args.append("--non-streaming")
+    if result_dir is not None:
+        args += [
+            "--percentile-metrics", "ttft,tpot,itl,e2el",   # e2el 필수(아니면 latency 누락)
+            "--metric-percentiles", "50,99",
+            "--save-result",
+            "--result-dir", str(result_dir),
+            "--save-detailed",          # per-request ITL 분포 등 보존
+        ]
+        if result_filename:
+            args += ["--result-filename", result_filename]
+    return args
 
 
-# ── single sweep point (Grid 조건 1개 테스트) ─────────────────────────────────
-# 하나의 실험 조건(예: 질문512 답변128 QPS4)에 대해:
-# 1) 웜업 50발 → 서버 상태 확인 (에러율, TTFT 체크)
-# 2) 통과하면 실전 200발 → 결과를 JSONL 파일로 저장
+async def run_bench(args: list[str]) -> int:
+    """benchmark_serving를 서브프로세스로 실행하고 종료코드 반환. stdout/stderr는 상속(로그에 그대로)."""
+    proc = await asyncio.create_subprocess_exec(sys.executable, "-m", BENCH_MODULE, *args)
+    await proc.wait()
+    return proc.returncode if proc.returncode is not None else 0
+
+
+# ── single sweep point (Grid 조건 1개 측정) ───────────────────────────────────
+# 하나의 실험 조건(예: prefill1024 decode512 QPS1)에 대해:
+#   1) warmup: 공식 benchmark_serving 소량 non-streaming 호출 (UCX cold-start 흡수, 버림)
+#   2) measured: 공식 benchmark_serving 본 호출 → bench_<point>.json (집계+per-request)
+#   3) per-side: measured 윈도우 전/후 orchestrator /prometheus/metrics 스냅샷 → prom_<point>.json
 async def run_point(
     base_url: str,
     config: str,
     prefill_len: int,
     decode_len: int,
     rate: float,
-    out_path: Path,
+    result_filename: str,
+    out_dir: Path,
     prom_out: Path | None = None,
 ) -> bool:
-    """항상 warmup → measured 실행 후 JSONL 저장. 항상 True 반환 (abort 게이트 제거).
-    prom_out 지정 시 measured 윈도우 전/후로 orchestrator /prometheus/metrics를 스냅샷해
-    per-side(prefill/decode) RPS 산출용 원본을 저장(warmup 제외 = 변인통제)."""
+    """공식 benchmark_serving로 warmup→measured 실행. measured 결과 = out_dir/result_filename.
+    prom_out 지정 시 measured 윈도우 전/후로 per-side 카운터 스냅샷(warmup 제외 = 변인통제).
+    성공(rc==0 + result.json 생성) 시 True."""
 
+    # ── 1단계: warmup (버림) — disagg UCX 첫 연결·스케줄러 ramp 흡수 ──
+    #   benchmark_serving 내장 warmup 없음 → 소량 non-streaming 호출. save 안 함.
+    #   짧은 고정 ISL/OSL(128/8): UCX 연결만 데우면 되므로 빠르게(decode-heavy에서도 느리지 않게).
+    warmup_args = build_bench_args(base_url, 128, 8, rate,
+                                   WARMUP_N, None, None, streaming=False)
+    await run_bench(warmup_args)
+
+    # ── 2단계: measured (공식 측정) — per-side 카운터로 윈도우 bracket ──
     before_prom = after_prom = None   # async with 밖에서 읽으므로 미리 None
-
-    # limit=0: 동시 연결 수 제한 없음 (수백 개 요청이 동시에 날아감)
-    connector = aiohttp.TCPConnector(limit=0)
-    async with aiohttp.ClientSession(connector=connector) as session:
-
-        # [내부 함수] n개의 요청을 포아송 분포(실제 유저들의 불규칙한 접속 패턴)에 맞춰 비동기로 발사
-        # random.expovariate(rate): QPS=4면 평균 0.25초 간격이지만, 실제로는 랜덤하게 몰리거나 빔
-        async def fire_phase(phase: str, n: int) -> list[Result]:
-            results: list[Result] = []
-            tasks: list[asyncio.Task] = []
-            for i in range(n):
-                req_id = f"{config}_{prefill_len}_{decode_len}_{rate}_{phase}_{i}"
-                delay = random.expovariate(rate)  # 포아송 분포 기반 랜덤 대기
-                await asyncio.sleep(delay)
-                t = asyncio.create_task(         # 비동기로 요청 발사 (안 기다리고 다음으로)
-                    _do_request(session, base_url, req_id, phase,
-                                prefill_len, decode_len, rate)
-                )
-                tasks.append(t)
-            for t in tasks:
-                results.append(await t)  # 모든 요청이 끝날 때까지 대기
-            return results
-
-        # ── 1단계: 준비운동 (웜업, 버림) ──
-        # warmup의 모든 요청은 fire_phase 안에서 await 완료되므로, measured 시작 시점엔 이미 drain됨
-        # → 아래 before 스냅샷은 warmup 완료분까지만 포함(깨끗한 측정 윈도우 경계).
-        warmup_results = await fire_phase("warmup", WARMUP_N)
-
-        # ── 2단계: 실전 측정 (항상 실행) ──
-        # 에러율/TTFT abort 게이트 제거: 느리거나 실패하는 config도 그대로 측정해 데이터에 남긴다.
-        # (분석은 status=="success"만 필터하므로 오염 없음. 느린 요청 자르기는 안 함 — 위 total=None.)
-        # per-side 카운터를 measured 윈도우만 정확히 bracket (warmup 제외).
+    async with aiohttp.ClientSession() as session:
         if prom_out is not None:
             before_prom = await prom_scrape.snapshot(session, base_url)
-        measured_results = await fire_phase("measured", MEASURED_N)
+        measured_args = build_bench_args(base_url, prefill_len, decode_len, rate,
+                                         MEASURED_N, out_dir, result_filename, streaming=True)
+        rc = await run_bench(measured_args)
         if prom_out is not None:
             after_prom = await prom_scrape.snapshot(session, base_url)
 
-        all_results = warmup_results + measured_results
-
-    # ── 3단계: 결과를 JSONL 파일로 저장 (한 줄에 요청 1개의 전체 측정값) ──
-    with open(out_path, "w") as f:
-        for r in all_results:
-            f.write(json.dumps(asdict(r)) + "\n")
-
-    # ── 3-b: per-side 스냅샷 저장 (analyze가 RPS=(after-before)/window_s 계산) ──
+    # ── 3단계: per-side 스냅샷 저장 (analyze가 RPS=(after-before)/window_s 계산) ──
     if prom_out is not None and before_prom is not None and after_prom is not None:
         window_s = after_prom.get("ts", 0) - before_prom.get("ts", 0)
         with open(prom_out, "w") as f:
             json.dump({"before": before_prom, "after": after_prom, "window_s": window_s}, f)
 
-    return True   # measured 항상 실행 → 항상 .done (abort 게이트 제거)
+    # 성공판정: benchmark_serving 종료코드 0 + result.json 생성
+    result_path = out_dir / result_filename
+    ok = (rc == 0) and result_path.exists()
+    if not ok:
+        print(f"  [bench] FAILED rc={rc} result_exists={result_path.exists()}", flush=True)
+    return ok
 
 
 # ── S3 sync (백그라운드 자동 백업) ─────────────────────────────────────────────
@@ -275,7 +218,7 @@ class S3Syncer:
         self.log_dir = log_dir
         self.interval = interval
         # S3 저장 경로: s3://버킷/raw/custom/20260518/hostname/configA1/
-        # "custom" prefix → sweep_official.py(공식 벤치) 결과와 구분.
+        # "custom" prefix → 우리 하네스(sweep + benchmark_serving) 산출물 경로 구분용.
         # config 한 단계 더 → 같은 호스트에서 여러 config 결과 보관해도 안 섞임.
         date = _dt.datetime.utcnow().strftime("%Y%m%d")
         host = socket.gethostname()
@@ -363,7 +306,6 @@ class S3Syncer:
 # ── health check ──────────────────────────────────────────────────────────────
 # [헬스 체크 함수] 서버가 완전히 켜져서 트래픽을 받을 준비가 될 때까지 기다립니다.
 async def wait_for_health(base_url: str, timeout_s: int = 300) -> None:
-    import aiohttp
     deadline = time.time() + timeout_s
     print(f"Waiting for {base_url}/v1/completions ...", flush=True)
     connector = aiohttp.TCPConnector()
@@ -425,7 +367,7 @@ async def fetch_perf_metrics(base_url: str, out_path: Path) -> None:
 async def main(args: argparse.Namespace) -> None:
     base_url = args.base_url.rstrip("/")
     config = args.config
-    out_dir = Path(LOG_DIR) / config  # 예: ./results/D/
+    out_dir = Path(LOG_DIR) / config  # 예: ./results/T1/
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 실험 영수증 생성 (나중에 "이 폴더가 뭐였지?" 할 때 보는 파일) ──
@@ -446,6 +388,7 @@ async def main(args: argparse.Namespace) -> None:
             "framework": "tensorrt-llm",
             "version": "1.2.1",
             "model": MODEL_NAME,
+            "load_tool": "benchmark_serving",   # 부하·측정 = 공식 도구 (sweep은 오케스트레이션)
             "context": {"num_instances": num_ctx, "tp": ctx_tp, "pp": ctx_pp},
             "generation": {"num_instances": num_gen, "tp": gen_tp, "pp": gen_pp},
             "placement": placement,
@@ -478,13 +421,13 @@ async def main(args: argparse.Namespace) -> None:
         for r in RATES:
             points.append((pl, dl, r))
 
-    print(f"Grid: {len(points)} points × (warmup={WARMUP_N} + measured={MEASURED_N})", flush=True)
+    print(f"Grid: {len(points)} points × (warmup={WARMUP_N} + measured={MEASURED_N}), load=benchmark_serving", flush=True)
 
     done = 0
     skipped = 0
     for prefill_len, decode_len, rate in points:
         point_id = f"p{prefill_len}_d{decode_len}_r{rate}"  # 파일명 = 실험 조건
-        out_path = out_dir / f"{point_id}.jsonl"             # 결과 저장 파일
+        bench_file = f"bench_{point_id}.json"                # benchmark_serving --save-result 결과
         marker_done   = out_dir / f".done_{point_id}"        # 완료 도장 (재실행 시 스킵)
         marker_failed = out_dir / f".failed_{point_id}"      # 실패 도장
 
@@ -496,8 +439,9 @@ async def main(args: argparse.Namespace) -> None:
         print(f"[{done+1}/{len(points)}] prefill={prefill_len} decode={decode_len} rate={rate} ...", flush=True)
 
         try:
-            ok = await run_point(base_url, config, prefill_len, decode_len, rate, out_path,
-                                  prom_out=out_dir / f"prom_{point_id}.json")
+            ok = await run_point(base_url, config, prefill_len, decode_len, rate,
+                                 result_filename=bench_file, out_dir=out_dir,
+                                 prom_out=out_dir / f"prom_{point_id}.json")
         except Exception as exc:
             print(f"  ERROR: {exc}", flush=True)
             marker_failed.touch()
@@ -520,7 +464,7 @@ async def main(args: argparse.Namespace) -> None:
     syncer.stop()
 
 
-# ── 진입점: python sweep.py --config D --base-url http://localhost:8000 ──────
+# ── 진입점: python sweep.py --config T1 --base-url http://localhost:8000 ──────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="config 라벨 (예: T1|T2|T3|T4). analyze.py COST_PER_HR 키와 일치시킬 것")

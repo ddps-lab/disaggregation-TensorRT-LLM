@@ -104,6 +104,17 @@ git push -u origin disagg-exp/trtllm-v1.2.1        # push 완료
 - **검증**: py_compile(3.9) + 기능테스트(3.11, aiohttp/numpy 스텁): 파서·_pick(_total 자동매칭)·load_prom(RPS/TPS 산식)·graceful(파일없음/None/window0)·토큰길이 폴백 전부 PASS. **런타임(카운터 실노출)은 GPU 스모크에서**(병렬화-KV전송-측정.md §9).
 - 문서: 병렬화-KV전송-측정.md §6/§7/§9 + CLAUDE 파일맵 + README(§1 prom_scrape·§5 prom_*.json·분석컬럼).
 
+## 2026-06-11 — 부하코어 교체: 손수 짠 aiohttp → 공식 benchmark_serving
+- **동기**: sweep.py가 공식 서버를 호출하긴 하나 부하·측정 *코드는 손수 짠 aiohttp*(공식 benchmark_serving 미호출, grep으로 import 0 확인). 사용자 결정 = "공식 위주" 철학상 진짜 공식 도구로 교체.
+- **조사**(Explore): v1.2.1 benchmark_serving 정확한 CLI/플래그·result.json 키·warmup 부재를 소스 확정(argparse :1019-1407, result.json :495-599, backend_request_func :309-314 `--random-ids`+`--tokenize-on-client`→`prompt_token_ids`).
+- **구현**:
+  - `sweep.py` 전면 개편: `Result`/`_do_request`/aiohttp `fire_phase` 제거 → `BENCH_MODULE`+`build_bench_args`+`run_bench`(asyncio.create_subprocess_exec). run_point = warmup(소량 `--non-streaming`) → before 스냅샷 → measured(`--save-result --save-detailed` → `bench_<point>.json`) → after 스냅샷 → `prom_<point>.json`. 오케스트레이션(그리드·resume·S3·metadata·perf·health) 유지. metadata에 `load_tool: benchmark_serving`.
+  - `analyze.py`: `load_points`+`analyze_point`(우리 계산) 제거 → `load_bench`(공식 result.json의 p50/p99_{ttft,tpot,itl,e2el}_ms·output_throughput 읽기). `load_prom` 시그니처 rows→mean_pt/mean_ct. 표 컬럼 = ttft/tpot/**itl/e2el**/out_tok·s + kv + per-side. `$/Mtok`=output_throughput.
+  - `prom_scrape.py` 변경 없음(서브프로세스를 bracket).
+- **변인통제**: `--percentile-metrics ttft,tpot,itl,e2el`(e2el 필수)·`--random-range-ratio 0`(길이 고정)·warmup은 별도 호출.
+- **검증**: py_compile(3) + 기능테스트(3.11): `_split_host_port`·`build_bench_args`(measured/warmup 플래그)·`load_bench`(키 매핑·fail_rate·mean_len)·`load_prom`·`print_table`(NO DATA 혼합)·`$/Mtok` 전부 PASS. **런타임은 GPU smoke**(benchmark_serving 실호출·temperature 기본값·tokenizer 로드).
+- 문서: 병렬화-KV전송-측정 §7·CLAUDE(파일맵·변인통제)·README(§1·§5·smoke·§B-0)·DEBUGGING·EXPERIMENT_PLAN 갱신.
+
 ## 아직 안 한 것 / 주의 (코드에서 확정 못 함 → GPU에서)
 - 로컬에서 TRT-LLM **빌드/실행 안 함** (컨테이너로 원격에서). 코드 정확성은 정적, **동작 검증은 GPU**.
 - 컨테이너 `nvcr.io/nvidia/tensorrt-llm/release:1.2.1` 실제 pull·기동, Qwen3-4B 로드, KV전송 동작, 출력정확성(비분리 비교) = 전부 Phase 0.

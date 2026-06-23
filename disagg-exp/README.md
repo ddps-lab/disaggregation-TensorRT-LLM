@@ -12,14 +12,14 @@
 
 | 파일 | 역할 | vLLM 1세대 대비 |
 |---|---|---|
-| **`sweep.py`** | 부하 생성기. OpenAI `/v1/completions`에 token-id prompt를 Poisson으로 쏘고, SSE 스트림으로 TTFT/E2E 직접 측정. 2-phase(warmup→measured), `.done/.failed` resume, S3 자동 백업. | 🔄 **계승(거의 그대로)**. OpenAI 호환이라 프레임워크 무관. 바뀐 곳: `MODEL_NAME`→Qwen3-4B, metadata에 ctx/gen TP·PP·placement 기록. |
-| **`analyze.py`** | 결과 JSONL→TTFT/TPOT/throughput(2종)/$per-Mtok 계산·표·플롯. | 🔄 **계승(로직 0 변경)**. 바뀐 곳: `COST_PER_HR`(g5/g6/g6e 단가), config 라벨(T1~T4). |
+| **`sweep.py`** | **오케스트레이터**. 그리드 루프마다 **공식 `benchmark_serving`을 서브프로세스로 호출**(warmup→measured → `bench_<point>.json`), measured 윈도우 전/후 per-side 스냅샷, `.done/.failed` resume, S3 자동 백업, metadata. | 🔄 골격 계승 + 🆕 **부하코어 교체**: 손수 짠 aiohttp → **공식 benchmark_serving**(측정=공식, sweep=오케스트레이션만). |
+| **`prom_scrape.py`** | per-side 스크레이퍼. orchestrator `/prometheus/metrics`의 `ctx_/gen_completed_requests_total`를 스냅샷 → prefill/decode RPS. | 🆕 **신규** (공식이 per-side를 안 줌 — 유일한 커스텀 메트릭). |
+| **`analyze.py`** | `bench_<point>.json`(공식 집계 TTFT/TPOT/ITL/E2EL/throughput) + `prom_*`(per-side) + `perf_*`(KV) → 표·플롯·$per-Mtok. | 🔄 **공식 result.json 읽기로 전환**(우리 계산 제거). `COST_PER_HR`(g5/g6/g6e), config T1~T4. |
 | **`setup.sh`** | 노드 부트스트랩. 측정 수집기(nvidia-smi dmon·ifstat·DCGM·chrony)·s5cmd 기동, 버전 검증. | 🔄 **계승(수집기 그대로)** + 🆕 **설치부 교체**: vLLM/LMCache/venv 빌드 → **NGC 컨테이너 모델**(tensorrt_llm 사전설치 확인). |
 | **`launch_trtllm.sh`** | 서버 기동기. config+role(context/generation/proxy)별로 `trtllm-serve`를 띄우고 disagg config YAML을 런타임 생성. | 🆕 **신규** (vLLM의 `launch_configs.sh`를 대체). 골격(role 분기·env·포트규약)만 계승, 내부는 전면 교체. |
 | **`ctx_extra_llm_api_options.yaml`** | **context(prefill) 워커**의 변인통제 (bf16·TRTLLM attn·block_reuse off·chunked off·cuda_graph off·overlap off). | 🆕 **신규**. vLLM에선 CLI 플래그(`--no-enable-prefix-caching` 등)였던 걸 TRT-LLM은 이 YAML로. |
 | **`gen_extra_llm_api_options.yaml`** | **generation(decode) 워커**의 변인통제 (cuda_graph on·overlap on). | 🆕 **신규**. (동상) |
 | **`disagg_config.yaml`** | orchestrator(=`trtllm-serve disaggregated`)가 읽는 **1P1D 정적 템플릿** (수동 실행/참조용). | 🆕 **신규** (vLLM의 `disagg_proxy_server.py`를 대체하는 개념). |
-| **`prom_scrape.py`** | **per-side 스크레이퍼**. orchestrator `/prometheus/metrics`의 `ctx_/gen_completed_requests_total`를 measured 윈도우 전/후로 스냅샷 → prefill/decode RPS 산출용. sweep가 호출, analyze가 RPS·TPS 계산. | 🆕 **신규** (공식 도구가 per-side를 안 줌 — 유일한 커스텀 메트릭 조각). |
 | **`trtllm_support_matrix.md`** | **Phase 0 게이트** 결과표 — 어떤 (TP,PP) 조합이 안 깨지나 실측 기록. | 🆕 **신규** (TRT-LLM은 비대칭 PP가 미보증이라 사전 게이트 필요). |
 
 **❌ vLLM에 있었지만 안 가져온 것 (TRT-LLM에 불필요):**
@@ -51,7 +51,7 @@ LABEL=smoke NUM_CTX=1 NUM_GEN=1 CTX_TP=1 CTX_PP=1 GEN_TP=1 GEN_PP=1 LOG_LEVEL=de
 # 스윕(단일 포인트, warmup 3 / measured 5):
 SWEEP_PD_PAIRS="1024,512" SWEEP_RATES=1.0 SWEEP_WARMUP_N=3 SWEEP_MEASURED_N=5 \
   python sweep.py --config smoke --base-url http://localhost:8000 --s3-bucket ""
-python analyze.py --configs smoke      # status:success + kv_p50ms 컬럼에 값 → 통과
+python analyze.py --configs smoke      # bench_*.json 생성 + 표에 ttft/tpot/e2el 값 + (가능하면) pf/dc_rps → 통과
 # 통과하면 LOG_LEVEL 빼고(=info) 아래 본 스윕. (디버그 토글 상세 → DEBUGGING.md)
 ```
 
@@ -95,6 +95,51 @@ bash launch_trtllm.sh proxy
 ```
 > inter-node는 EFA 없으면 KV전송이 TCP라 느림 → 구조/correctness 비교용. 깨끗한 성능은 intra-node 중심.
 
+### B-0) inter-node P1D1 smoke (g6.xlarge ×2 — 첫 런타임 검증, 권장 시작점)
+> 1-GPU 박스 2대로 P1D1: 노드 P=prefill(ctx 워커 + orchestrator), 노드 D=decode(gen 워커).
+> "길게 켜기 전 적은 요청 5분 검증". 모든 런타임은 원격(SSH), 로컬은 편집·git만(aws 규칙).
+
+**0. 사전 (양 노드 공통, 컨테이너 안)**
+```bash
+# (IP 갱신/host key 바뀌었으면) 로컬에서: ssh-keygen -R <공인IP> + ~/.ssh/config HostName 수정
+git clone https://github.com/ddps-lab/disaggregation-TensorRT-LLM.git
+cd disaggregation-TensorRT-LLM && git checkout disagg-exp/trtllm-v1.2.1
+docker run --rm -it --gpus all --network host --ipc host --shm-size=8g \
+  -v "$PWD":/work -w /work/disagg-exp nvcr.io/nvidia/tensorrt-llm/release:1.2.1 bash
+bash setup.sh                              # 1.2.1 확인 + 수집기 + chrony(시계동기, inter 필수)
+hostname -I | awk '{print $1}'             # 각 노드 사설IP 확보 (orchestrator가 씀)
+```
+**⚠️ 보안그룹**: 두 노드가 `:8001`/`:8011` + UCX(에페메랄 포트)로 통신 → 같은 VPC/서브넷 + SG가 노드 간 트래픽 허용(self-referencing SG로 전부 열기). 막히면 health/KV전송 멈춤.
+
+**1. 노드 D (decode) 먼저**
+```bash
+export UCX_TLS=tcp,cuda_copy,sm,self       # cross-node = TCP 강제(EFA 없음). 안 주면 UCX 실패 가능
+LABEL=smoke NUM_GEN=1 GEN_TP=1 GEN_PP=1 GEN_GPU_BASE=0 LOG_LEVEL=debug \
+  bash launch_trtllm.sh generation         # :8011
+```
+**2. 노드 P (context 워커 + orchestrator)**
+```bash
+export UCX_TLS=tcp,cuda_copy,sm,self
+LABEL=smoke NUM_CTX=1 CTX_TP=1 CTX_PP=1 CTX_GPU_BASE=0 LOG_LEVEL=debug \
+  bash launch_trtllm.sh context            # :8001
+LABEL=smoke NUM_CTX=1 NUM_GEN=1 PLACEMENT=inter \
+  CTX_URLS="<P_사설IP>:8001" GEN_URLS="<D_사설IP>:8011" \
+  bash launch_trtllm.sh proxy              # :8000 ← sweep 조준점
+```
+**3. 부하(적은 요청) + 분석 (노드 P, 새 셸)**
+```bash
+SWEEP_PD_PAIRS="1024,512" SWEEP_RATES=1.0 SWEEP_WARMUP_N=3 SWEEP_MEASURED_N=5 PLACEMENT=inter \
+  python sweep.py --config smoke --base-url http://localhost:8000 --s3-bucket ""
+python analyze.py --configs smoke
+```
+**4. per-side 카운터 실노출 확인**
+```bash
+curl -s localhost:8000/prometheus/metrics | grep -E 'ctx_completed|gen_completed'
+cat results/smoke/prom_p1024_d512_r1.0.json
+```
+**통과 기준**: 기동 `[ok] healthy` ×3 → sweep가 `bench_*.json`(공식 결과)·`perf_*.json`·`prom_*.json` 생성 → analyze 표에 `ttft/tpot/e2el`·`kv_p50ms` 값 → `ctx_/gen_completed_requests_total` **둘 다 >0**(+ 표 `pf_rps/dc_rps/pf_tps/dc_tps`). 카운터 안 보이면 graceful `n/a` → 워커 `trtllm_request_success_total` 폴백(예상된 미지수, `병렬화-KV전송-측정.md §9`).
+**inter 특유 실패**: health timeout=SG 미개방 / bench rc≠0·hang=KV전송 멈춤(UCX_TLS·SG) / kv n/a=`return_perf_metrics` 확인. KV전송 느림(큰 TTFT)은 TCP라 정상.
+
 ---
 
 ## 3. 주요 환경변수 (launch_trtllm.sh)
@@ -130,13 +175,13 @@ bash launch_trtllm.sh proxy
 
 ## 5. 산출물 & 디버깅
 **측정 산출물** (`$EXP_LOG_DIR/<config>/`):
-- `p{..}.jsonl` — 요청별 TTFT/E2E/status (sweep)
+- `bench_p{..}.json` — **공식 benchmark_serving 결과** (TTFT/TPOT/ITL/E2EL/throughput + per-request ITL) ★
 - `perf_p{..}.json` — `/perf_metrics` 스냅샷(KV전송시간·블록재사용) ★
 - `prom_p{..}.json` — measured 윈도우 전/후 per-side 카운터 스냅샷(prefill/decode RPS 산출용) ★
 - `metadata.json` — ctx/gen TP·PP·xPyD·placement·cache_backend
 - 시스템: `nvidia_smi.csv`·`ifstat.csv`·`dcgm.log` (1Hz/2s), `s3_sync.log`, `clock_baseline_*`
 
-**분석**: `analyze.py --plot` → TTFT/TPOT/throughput(2종)/$Mtok + `kv_p50ms`/`kv_p99ms`(KV전송시간) **+ `pf_rps`/`dc_rps`/`pf_tps`/`dc_tps`(per-side prefill/decode RPS·TPS)** 표·플롯. (per-side는 prom_*.json 있을 때만, 없으면 'n/a')
+**분석**: `analyze.py --plot` → **공식 집계** `ttft_p50/p99`·`tpot_p50/p99`·`itl_p99`·`e2el_p99`·`out_tok/s`·`$/Mtok` + `kv_p50/p99`(KV전송시간) **+ `pf_rps`/`dc_rps`/`pf_tps`/`dc_tps`(per-side)** 표·플롯. (kv·per-side는 perf/prom 있을 때만, 없으면 'n/a')
 
 **디버깅 / 로그구조 / KV·perf 읽는 법 / hang 진단 / 디버그 토글 켜고 끄기 → `DEBUGGING.md`.**
 > ⚠️ 측정 런에선 디버그 로그 OFF(`LOG_LEVEL` 미설정). 디버그 로그 = I/O 노이즈 → 변인 오염.

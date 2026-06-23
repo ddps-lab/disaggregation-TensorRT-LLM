@@ -14,7 +14,7 @@ LOG_LEVEL=debug bash launch_trtllm.sh all
 # 2) 최소 요청 (단일 PD 포인트, warmup 3 / measured 5)
 SWEEP_PD_PAIRS="1024,512" SWEEP_RATES=1.0 SWEEP_WARMUP_N=3 SWEEP_MEASURED_N=5 \
 python sweep.py --config smoke --base-url http://localhost:8000 --s3-bucket ""
-# 3) 확인: status:success + perf에 KV전송시간 존재
+# 3) 확인: bench_*.json 생성(공식 결과) + perf에 KV전송시간 존재
 python analyze.py --configs smoke
 ```
 통과하면 → `LOG_LEVEL` 빼고(=info) 본 스윕.
@@ -45,10 +45,11 @@ results/
 ├── clock_baseline_<host>.txt  s3_sync.log
 ├── .pid_nvidia_dmon  .pid_ifstat  .pid_dcgm_loop
 └── <config>/                                  # 예: T1/, smoke/
-    ├── p{pl}_d{dl}_r{rate}.jsonl              # 요청별 측정 (TTFT/E2E/status)
-    ├── perf_p{pl}_d{dl}_r{rate}.json          # /perf_metrics 스냅샷 (KV전송시간 등)  ★신규
+    ├── bench_p{pl}_d{dl}_r{rate}.json         # 공식 benchmark_serving 결과 (TTFT/TPOT/ITL/E2EL/throughput)
+    ├── prom_p{pl}_d{dl}_r{rate}.json          # per-side 카운터 스냅샷 (prefill/decode RPS)
+    ├── perf_p{pl}_d{dl}_r{rate}.json          # /perf_metrics 스냅샷 (KV전송시간 등)
     ├── .done_* / .failed_*                    # resume 마커
-    └── metadata.json                          # config·ctx/gen TP·PP·placement·cache_backend
+    └── metadata.json                          # config·ctx/gen TP·PP·placement·load_tool
 ```
 
 **기동 에러 추적**: 워커가 즉시 죽으면 `trtllm_<LABEL>_context_*.log` 끝부분 확인 (대부분 extra YAML 키 오타 → `ValidationError`).

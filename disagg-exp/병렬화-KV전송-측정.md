@@ -134,10 +134,12 @@ vLLM은 각 노드 `/metrics`의 누적 토큰 카운터를 1초 차분해 per-s
 ## 7. 부하/측정 도구 — 공식 최대 + per-side만 커스텀 (vLLM 공식 벤치 브랜치 철학)
 
 - **공식 부하 도구**: `python -m tensorrt_llm.serve.scripts.benchmark_serving` — vLLM `benchmark_serving.py`의 fork, **공식 disagg slurm 벤치(`examples/disaggregated/slurm/benchmark/run_benchmark.sh`)가 호출**. orchestrator :8000 OpenAI를 침. token-id ISL 고정(`--random-ids --tokenize-on-client --random-range-ratio 0`)·`--ignore-eos`·OSL(`--random-output-len`)·Poisson(`--request-rate --burstiness 1.0`)·`--max-concurrency` 지원.
-- ⚠️ **검증으로 잡은 함정 — E2EL은 기본 출력에서 빠짐**: 결과 JSON에 throughput(무조건)·TTFT·TPOT는 기본(`--percentile-metrics`=`ttft,tpot,itl`)으로 나오지만 **E2EL(전체 latency)는 안 나옴**. `--percentile-metrics ttft,tpot,itl,e2el`을 줘야 `*_e2el_ms`가 출력됨(benchmark_serving.py:537-539, 공식 run_benchmark.sh:71은 이미 e2el 포함). → 공식 도구를 쓸 땐 이 플래그 필수. **단 우리 sweep.py는 `e2e_s`를 직접 재므로 무관.**
-- **단일 엔드포인트 한계**: benchmark_serving은 한 base-url만 침(benchmark_serving.py:703-708) → **per-side를 못 냄**(전체 RPS만). per-side는 별도 스크레이퍼 필요.
+- ⚠️ **검증으로 잡은 함정 — E2EL은 기본 출력에서 빠짐**: 결과 JSON에 throughput(무조건)·TTFT·TPOT는 기본(`--percentile-metrics`=`ttft,tpot,itl`)으로 나오지만 **E2EL(전체 latency)는 안 나옴**. → sweep가 **`--percentile-metrics ttft,tpot,itl,e2el`을 항상 명시**(benchmark_serving.py:537-539, 공식 run_benchmark.sh:71과 동일).
+- ⚠️ **내장 warmup 없음**: benchmark_serving은 `--num-prompts`를 전부 측정(burn-in 없음) → sweep가 measured 전에 **소량 `--non-streaming` 호출로 warmup**(disagg UCX cold-start 흡수, run_benchmark.sh 패턴).
+- **단일 엔드포인트 한계**: benchmark_serving은 한 base-url만 침(benchmark_serving.py:703-708) → **per-side를 못 냄**(전체만). → per-side는 별도 `prom_scrape.py`가 measured 윈도우 전/후 스냅샷(서브프로세스를 bracket).
 - `trtllm-bench`는 `--engine_dir` in-process라 serving 엔드포인트 못 침 → 부하 도구 아님.
-- **채택 구조**: sweep.py를 **부하코어 겸 오케스트레이터로 유지**(전체메트릭을 공식과 정의-동일하게 이미 측정 + measured 윈도우 전후로 per-side 스크레이프를 끼워넣을 수 있음 — 단일엔드포인트 benchmark_serving은 못 하는 것). 커스텀=**per-side 스크레이퍼(`prom_scrape.py`) + analyze per-side**뿐. 공식 benchmark_serving은 **선택적 교차검증**(`sweep_official.py`)으로 전체메트릭 일치 확인(논문 비교가능성).
+- **채택 구조 (구현됨 2026-06-11)**: **부하코어 = 공식 `benchmark_serving`** (sweep가 포인트마다 서브프로세스로 호출 → `bench_<point>.json`). sweep.py는 **오케스트레이션만**(그리드·resume·S3·metadata·warmup·per-side 스냅샷). analyze는 `bench_<point>.json`의 공식 집계(TTFT/TPOT/ITL/E2EL/throughput)를 읽고 + per-side(prom) + KV(perf) 병합. **커스텀 = 오케스트레이션 + `prom_scrape.py`(per-side) + `analyze.py`** — 전부 공식이 못 주는 것뿐. 손수 짠 aiohttp 부하는 제거됨.
+- **정확한 측정 호출**(sweep `build_bench_args`): `--model $MODEL --backend openai --host H --port P --dataset-name random --random-ids --tokenize-on-client --random-input-len ISL --random-output-len OSL --random-range-ratio 0.0 --ignore-eos --num-prompts N --request-rate R --burstiness 1.0 --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,99 --save-result --result-dir DIR --result-filename bench_<point>.json --save-detailed`.
 
 ---
 
