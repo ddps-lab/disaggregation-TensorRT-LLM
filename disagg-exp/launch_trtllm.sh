@@ -132,7 +132,7 @@ wait_health() {  # host port [timeout_s]
   echo "[ok] healthy ${host}:${port}"
 }
 
-# disagg orchestrator config YAML 생성 (런별로 LOG_DIR에). 정적 템플릿(disagg_config.yaml)과 별개.
+# disagg orchestrator config YAML 생성 (런별로 LOG_DIR에). 이게 유일한 disagg config 생성 경로(정적 파일 없음).
 write_disagg_yaml() {
   local out="$1" ctx_urls gen_urls n_ctx n_gen
   ctx_urls="$(build_urls ctx)"; gen_urls="$(build_urls gen)"

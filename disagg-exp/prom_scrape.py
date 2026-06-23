@@ -1,6 +1,6 @@
 """per-side Prometheus 스크레이퍼 — prefill/decode를 따로 재는 유일한 커스텀 조각.
 
-배경 (소스 전수조사 + 적대적 검증, 2026-06-10 — 병렬화-KV전송-측정.md §6):
+배경 (소스 전수조사 + 적대적 검증, 2026-06-10 — LEARNING_NOTES.md §병렬화·KV전송·per-side 6번):
   - 전체 메트릭(TTFT/TPOT/throughput/latency)은 sweep.py가 이미 측정(공식 benchmark_serving과 정의 동일).
   - per-side RPS만 공식 도구가 못 줌 → 이 스크레이퍼가 필요.
   - per-side TPS는 공식 토큰 카운터가 *어디에도 없어*(collector.py:27-68에 토큰 카운터 0개,

@@ -166,7 +166,7 @@ def load_prom(config_dir: Path, point_id: str, mean_pt: float | None, mean_ct: f
     강제된 토큰길이(mean_pt/mean_ct)로 per-side TPS를 파생.
     - prefill_rps = (ctx_after − ctx_before)/window_s, decode_rps = (gen_after − gen_before)/window_s
       (ctx_/gen_completed_requests_total — prom_scrape.py 참조)
-    - per-side TPS는 공식 토큰 카운터가 없어(병렬화-KV전송-측정.md §6) RPS × 토큰수로 파생.
+    - per-side TPS는 공식 토큰 카운터가 없어(LEARNING_NOTES.md §병렬화·KV전송·per-side 6번) RPS × 토큰수로 파생.
     파일 없으면(=스크레이프 비활성/orchestrator 미노출) 빈 dict → 표에 'n/a'."""
     pf = config_dir / f"prom_{point_id}.json"
     if not pf.exists():
