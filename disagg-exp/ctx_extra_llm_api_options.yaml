@@ -28,5 +28,7 @@ kv_cache_config:
   dtype: auto
 
 cache_transceiver_config:
-  backend: UCX               # DEFAULT|UCX|NIXL|MOONCAKE|MPI 중. gen과 반드시 동일
+  backend: NIXL              # =DEFAULT(NVIDIA 기본·공식 disagg 벤치 일치). gen과 반드시 동일.
+                             # no-EFA에선 내부 transport=UCX(TRTLLM_NIXL_KVCACHE_BACKEND 기본=UCX) → UCX_TLS=tcp 적용.
+                             # libfabric은 EFA 쓸 때만(리빌드 필요). 문제 시 폴백=UCX.
   max_tokens_in_buffer: 8192 # >= 최대 ISL 권장 (prefill 2048이면 충분)

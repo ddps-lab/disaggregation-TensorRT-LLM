@@ -157,9 +157,9 @@ generation_servers:     # = Decode (D)
 
 **vLLM과의 결정적 차이**: vLLM은 커넥터(P2pNccl/LMCache/NIXL)마다 PP·비대칭TP 지원이 갈렸다. **TRT-LLM은 cache_transceiver 백엔드가 무엇이든 비대칭 PP·TP를 막지 않는다** — 호환성 게이트는 *병렬화 조합*이 아니라 *KV 동질성*(dtype·head수·layer수·non-MLA·beam=1)만 본다(`cacheFormatter.cpp::inquireSupport`). 그래서 dense GQA Qwen3-4B는 비대칭 TP·PP를 1급으로 통과한다. (이게 vLLM에서 TRT-LLM으로 넘어온 직접 이유 — `LEARNING_NOTES.md §프레임워크 판정·배경`.)
 
-- 우리 설정: `cache_transceiver_config.backend: UCX`, Ethernet 노드 `UCX_TLS=tcp,cuda_copy,sm,self`.
-- `DEFAULT == NIXL` (examples README). 우리는 명시적으로 UCX 고정.
-- 근거: `tensorrt_llm/llmapi/llm_args.py:1807-1843` (CacheTransceiverConfig), `examples/disaggregated/README.md`.
+- 우리 설정: `cache_transceiver_config.backend: NIXL`(=DEFAULT), Ethernet 노드 `UCX_TLS=tcp,cuda_copy,sm,self`.
+- `DEFAULT == NIXL` (examples README, `kv_cache_transceiver.py:41`). **우리는 NIXL 채택**(2026-06: 공식 disagg 벤치 `slurm/benchmark/config.yaml`이 `backend: DEFAULT` 사용 + 우리 부하코어 benchmark_serving과 짝 맞음 → 재현성). **no-EFA에선 NIXL 내부 transport=UCX**(`TRTLLM_NIXL_KVCACHE_BACKEND` 기본=UCX) → 위 UCX_TLS 그대로 적용. libfabric은 EFA 쓸 때만(리빌드 필요). 문제 시 폴백=UCX 직접(둘 다 같은 TCP 경로).
+- 근거: `tensorrt_llm/llmapi/llm_args.py:1807-1843` (CacheTransceiverConfig), `examples/disaggregated/README.md`(:15,:49-59), `slurm/benchmark/config.yaml`.
 
 ---
 
@@ -169,13 +169,13 @@ vLLM처럼 커넥터 클래스를 고르는 게 아니라, **disagg YAML / 워�
 
 | `cache_transceiver_config.backend` | 비고 |
 |---|---|
-| `UCX` | 우리 기본. UCX TLS로 transport 경로 제어. 컨테이너 사전설치 |
-| `NIXL` | `DEFAULT`의 실체. 별도 플러그인 빌드 필요할 수 있음 |
+| `NIXL` | **우리 채택**(=DEFAULT, 공식 기본). 내부 transport는 `TRTLLM_NIXL_KVCACHE_BACKEND`(기본 UCX)로 갈아끼움 → 추상화 한 겹 = 이식성. no-EFA에선 UCX-TCP로 내려감 |
+| `UCX` | **폴백/내부 transport**. UCX TLS로 경로 제어. 컨테이너 사전설치. NIXL 미동작 시 직접 지정 |
 | `MOONCAKE` | 외부 KV store. 본 실험 범위 밖 |
 | `MPI` | 레거시. DEPRECATED 경로 |
-| `DEFAULT` | =NIXL |
+| `DEFAULT` | =NIXL (우리가 명시적으로 NIXL로 핀) |
 
-- ctx/gen **양쪽 동일 backend**여야 KV 전송 호환 (우리 ctx/gen extra YAML 둘 다 UCX).
+- ctx/gen **양쪽 동일 backend**여야 KV 전송 호환 (우리 ctx/gen extra YAML 둘 다 NIXL).
 - vLLM의 `--kv-transfer-config` JSON·`kv_producer/kv_consumer`·`kv_port`·`send_type=PUT_ASYNC`·`nccl_num_channels` 같은 P2pNccl 잡설정은 **TRT-LLM엔 없음** (orchestrator가 알아서 ctx→gen 라우팅).
 
 ---

@@ -32,7 +32,9 @@ mkdir -p "$LOG_DIR"
 
 export PYTHONHASHSEED="${PYTHONHASHSEED:-123}"
 # Ethernet(EFA 없음) 노드용. NVLink 없는 g5/g6/g6e PCIe intra-node에도 안전.
+# NIXL backend도 내부적으로 UCX를 쓰므로(TRTLLM_NIXL_KVCACHE_BACKEND 기본=UCX) 이 UCX_TLS가 그대로 적용됨.
 export UCX_TLS="${UCX_TLS:-tcp,cuda_copy,sm,self}"
+# export TRTLLM_NIXL_KVCACHE_BACKEND=UCX   # NIXL의 내부 transport(기본 UCX). EFA 쓸 때만 libfabric으로(리빌드 필요).
 
 # ---------- 로그레벨 / perf 메트릭 ----------
 LOG_LEVEL="${LOG_LEVEL:-info}"            # 서버 로그레벨. 측정=info. 디버그=debug|verbose|trace. (워커 --log_level / orchestrator -l)
@@ -51,8 +53,8 @@ NUM_CTX="${NUM_CTX:-1}"                   # context 인스턴스 수 (xPyD의 P)
 NUM_GEN="${NUM_GEN:-1}"                   # generation 인스턴스 수 (xPyD의 D; 1P3D면 3)
 CTX_TP="${CTX_TP:-1}"; CTX_PP="${CTX_PP:-1}"   # prefill 병렬화 (비대칭축)
 GEN_TP="${GEN_TP:-1}"; GEN_PP="${GEN_PP:-1}"   # decode  병렬화 (비대칭축)
-CACHE_BACKEND="${CACHE_BACKEND:-UCX}"     # disagg YAML용(정보성). ⚠️ 실제 KV백엔드는 ctx/gen extra YAML이 결정
-#                                           — 바꾸려면 ctx/gen_extra_llm_api_options.yaml의 cache_transceiver도 수정
+CACHE_BACKEND="${CACHE_BACKEND:-NIXL}"    # disagg YAML용(정보성). =DEFAULT(공식 기본). ⚠️ 실제 KV백엔드는 ctx/gen extra YAML이 결정
+#                                           — 바꾸려면 ctx/gen_extra_llm_api_options.yaml의 cache_transceiver도 수정. 폴백=UCX.
 
 # ---------- 포트 규약 (sweep.py가 :8000 조준 → proxy 절대 8000) ----------
 PROXY_HOST="${PROXY_HOST:-0.0.0.0}"

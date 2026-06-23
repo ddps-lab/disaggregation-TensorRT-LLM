@@ -26,7 +26,7 @@
 | dtype | **BF16 통일** (A10G/L4/L40S 전부 native) | — |
 | disagg 진입점 | `trtllm-serve disaggregated -c <yaml>` (`tensorrt_llm/commands/serve.py:646`) | ✅ 코드 확인 |
 | attention 백엔드 | **TRTLLM** (FlashInfer 금지 — 비대칭 TP 오출력 #6507) | — |
-| KV 전송 | `cache_transceiver_config.backend: UCX`, Ethernet 노드 `UCX_TLS=tcp,cuda_copy,sm,self` | ✅ cache_transceiver 코드 존재 |
+| KV 전송 | `cache_transceiver_config.backend: NIXL`(=DEFAULT, 공식 벤치 일치). no-EFA에선 내부 transport=UCX → `UCX_TLS=tcp,cuda_copy,sm,self`. 폴백=UCX | ✅ cache_transceiver 코드 존재 |
 
 ## Dealbreaker / 알려진 함정 (Front-loaded bad news — #2, #9)
 1. **T4(g4dn) 완전 탈락**: disagg 버전엔 T4 지원 없음(하드 abort #2760). → g5/g6/g6e만. (사용자가 T4 불필요 확정 → 무력화됨)
@@ -74,13 +74,13 @@ context_servers:
   tensor_parallel_size: 1     # P의 TP  ← 비대칭축
   pipeline_parallel_size: 1   # P의 PP  ← 비대칭축
   kv_cache_config: { free_gpu_memory_fraction: 0.85, enable_block_reuse: false }
-  cache_transceiver_config: { backend: "UCX" }
+  cache_transceiver_config: { backend: "NIXL" }   # =DEFAULT. no-EFA→내부 UCX-TCP. 폴백 UCX
   urls: ["localhost:8001"]
 generation_servers:
   num_instances: 1            # ★ = xPyD의 D 개수 (1P3D → 3)
   tensor_parallel_size: 1     # D의 TP  ← 비대칭축
   pipeline_parallel_size: 1   # D의 PP  ← 비대칭축
-  cache_transceiver_config: { backend: "UCX" }
+  cache_transceiver_config: { backend: "NIXL" }   # =DEFAULT. no-EFA→내부 UCX-TCP. 폴백 UCX
   urls: ["localhost:8002"]
 ```
 - **`generation_servers.num_instances` = D 개수** (xPyD 핵심 노브). context/generation 각각 독립 TP·PP → 대칭/비대칭 자유.

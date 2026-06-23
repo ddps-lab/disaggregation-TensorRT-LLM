@@ -25,5 +25,5 @@ kv_cache_config:
   dtype: auto
 
 cache_transceiver_config:
-  backend: UCX                     # ctx와 반드시 동일
+  backend: NIXL                    # ctx와 반드시 동일(=DEFAULT). no-EFA에선 내부 UCX-TCP. 폴백=UCX.
   max_tokens_in_buffer: 8192

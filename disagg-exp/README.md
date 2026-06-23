@@ -150,7 +150,7 @@ cat results/smoke/prom_p1024_d512_r1.0.json
 | `LABEL` | `T1` | config 라벨 (sweep `--config`·analyze `COST_PER_HR` 키와 일치시킬 것) |
 | `NUM_CTX` / `NUM_GEN` | `1` / `1` | xPyD의 P / D 개수 (1P3D면 `NUM_GEN=3`) |
 | `CTX_TP` `CTX_PP` / `GEN_TP` `GEN_PP` | `1` | prefill / decode 병렬화 (비대칭축) |
-| `CACHE_BACKEND` | `UCX` | KV전송: DEFAULT\|UCX\|NIXL\|MOONCAKE\|MPI (ctx==gen) |
+| `CACHE_BACKEND` | `NIXL` | KV전송: DEFAULT(=NIXL)\|UCX\|NIXL\|MOONCAKE\|MPI (ctx==gen). no-EFA→내부 UCX-TCP. 폴백 UCX |
 | `CTX_GPU_BASE` / `GEN_GPU_BASE` | `0` / `ctx 뒤` | GPU 배치 시작 인덱스 (inter면 각 노드서 0) |
 | `CTX_PORT_BASE` / `GEN_PORT_BASE` / `PROXY_PORT` | `8001`/`8011`/`8000` | 포트 규약 (proxy 8000 = sweep 조준, 고정) |
 | `CTX_URLS` / `GEN_URLS` | (localhost 자동) | inter-node 워커 host:port 목록 (개수==NUM_CTX/GEN) |
@@ -189,7 +189,7 @@ cat results/smoke/prom_p1024_d512_r1.0.json
    ```bash
    # context
    CUDA_VISIBLE_DEVICES=0,1 trtllm-serve Qwen3-4B --backend pytorch --tp_size 2 --port 8001 \
-     --extra_llm_api_options ctx.yaml   # cache_transceiver_config.backend: UCX; disable_overlap_scheduler: True
+     --extra_llm_api_options ctx.yaml   # cache_transceiver_config.backend: NIXL; disable_overlap_scheduler: True
    # generation
    CUDA_VISIBLE_DEVICES=2,3 trtllm-serve Qwen3-4B --backend pytorch --tp_size 2 --port 8002 \
      --extra_llm_api_options gen.yaml   # enable_block_reuse: false
@@ -327,7 +327,7 @@ results/
 | `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1` | KV전송 overlap 비활성 → 전송 타이밍 단순화(분리 측정) | `unset` |
 | `UCX_TLS=tcp,cuda_copy,sm,self` | UCX 전송 경로 강제(EFA 없음 노드) | 기본값이라 보통 유지 |
 | `UCX_LOG_LEVEL=debug` | UCX 핸드셰이크/전송 상세 | `unset` |
-| `CACHE_BACKEND=UCX` (launch env) | KV 백엔드 — **단 실제값은 워커 extra YAML이 결정**(disagg YAML은 정보성) | extra YAML 수정 |
+| `CACHE_BACKEND=NIXL` (launch env) | KV 백엔드 — **단 실제값은 워커 extra YAML이 결정**(disagg YAML은 정보성) | extra YAML 수정 |
 
 > 전송 백엔드를 정말 바꾸려면 `ctx/gen_extra_llm_api_options.yaml`의 `cache_transceiver_config.backend`를 직접 수정.
 

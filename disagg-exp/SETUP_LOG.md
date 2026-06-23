@@ -116,6 +116,12 @@ git push -u origin disagg-exp/trtllm-v1.2.1        # push 완료
 - **검증**: py_compile(3) + 기능테스트(3.11): `_split_host_port`·`build_bench_args`(measured/warmup 플래그)·`load_bench`(키 매핑·fail_rate·mean_len)·`load_prom`·`print_table`(NO DATA 혼합)·`$/Mtok` 전부 PASS. **런타임은 GPU smoke**(benchmark_serving 실호출·temperature 기본값·tokenizer 로드).
 - 문서: 병렬화-KV전송-측정 §7·CLAUDE(파일맵·변인통제)·README(§1·§5·smoke·§B-0)·DEBUGGING·EXPERIMENT_PLAN 갱신.
 
+## 2026-06-23 — KV 백엔드 UCX → NIXL(=DEFAULT) 변경
+- **이유**(사용자 제안 + 소스 확인): NIXL이 TRT-LLM **DEFAULT**(`kv_cache_transceiver.py:41`)이고 **공식 disagg 벤치 `slurm/benchmark/config.yaml`이 `backend: DEFAULT` 사용** → 우리가 채택한 공식 benchmark_serving과 짝이 맞아 재현성↑. NIXL은 transport 추상화라 이식성도↑.
+- **핵심**: no-EFA 환경에선 **NIXL 내부 transport = UCX**(`TRTLLM_NIXL_KVCACHE_BACKEND` 기본=UCX) → 기존 `UCX_TLS=tcp,cuda_copy,sm,self` 그대로 적용. 즉 **UCX 직접과 같은 TCP 경로·같은 속도**. libfabric은 EFA 쓸 때만(컨테이너 미포함, 리빌드 필요).
+- **변경 4곳**: ctx/gen extra YAML `cache_transceiver_config.backend: NIXL`(실제 결정), launch `CACHE_BACKEND` 기본 NIXL(정보성), 문서(CLAUDE 핀·스키마·LEARNING_NOTES KV백엔드·README env/디버그). **폴백=UCX** 명시.
+- **검증**: bash -n 통과. 런타임(NIXL이 컨테이너서 TCP로 실제 동작)은 GPU smoke에서 — 안 뜨면 backend를 UCX로 1줄 폴백.
+
 ## 아직 안 한 것 / 주의 (코드에서 확정 못 함 → GPU에서)
 - 로컬에서 TRT-LLM **빌드/실행 안 함** (컨테이너로 원격에서). 코드 정확성은 정적, **동작 검증은 GPU**.
 - 컨테이너 `nvcr.io/nvidia/tensorrt-llm/release:1.2.1` 실제 pull·기동, Qwen3-4B 로드, KV전송 동작, 출력정확성(비분리 비교) = 전부 Phase 0.
