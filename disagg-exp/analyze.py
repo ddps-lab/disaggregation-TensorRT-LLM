@@ -24,6 +24,14 @@ try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    # 패널 제목에 한글(요청큐/전송큐 등) 쓰므로 한글 폰트 지정(없으면 조용히 기본).
+    import matplotlib.font_manager as _fm
+    _avail = {f.name for f in _fm.fontManager.ttflist}
+    for _kf in ("AppleGothic", "Apple SD Gothic Neo", "NanumGothic", "Noto Sans CJK KR"):
+        if _kf in _avail:
+            plt.rcParams["font.family"] = _kf
+            break
+    plt.rcParams["axes.unicode_minus"] = False   # 한글폰트서 마이너스 깨짐 방지
     HAS_MPLOT = True
 except ImportError:
     HAS_MPLOT = False
@@ -597,9 +605,10 @@ def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
 
 
 def plot_latency_decomp(all_stats: dict, out_dir: Path) -> None:
-    """[compare #1] 모든 포인트의 지연 단계분해를 mean/p50/p99 묶음막대로.
-    한 요청 시간이 prefill_compute / prefill_queue / kv_transfer(버퍼대기) / decode_queue(슬롯대기, 보통 지배)
-    / decode / TTFT / TPOT / e2e 어디에 쓰이나. (perf_metrics, warmup 제외.)"""
+    """[compare #1] 요청 한 개의 시간이 어디서 대기/소비되나, 포인트별 mean/p50/p99 묶음막대.
+    요청 일생 순: ①요청큐 대기(prefill 슬롯) → ②온전한 prefill → ③KV캐시 전송큐 대기(버퍼·보통 최대)
+    → ④보내는 시간(KV 노드간 전송) → ⑤온전한 decode, 그리고 요약 ⑥TTFT ⑦TPOT ⑧e2e(공식 client E2EL).
+    e2e는 공식 E2EL 1개만(재구성과 0.3% 일치 검증 끝). (perf_metrics, warmup 제외.)"""
     if not HAS_MPLOT:
         return
     pts = [(c, p) for c in sorted(all_stats) for p in sorted(all_stats[c])]
@@ -622,21 +631,21 @@ def plot_latency_decomp(all_stats: dict, out_dir: Path) -> None:
                         for k in ("mean", "p50", "p99")})
         return out
 
+    # 요청 일생 순서: 도착 → ①요청큐 → ②prefill → ③KV전송큐(버퍼) → ④보내는시간 → ⑤decode, 그리고 요약 ⑥⑦⑧
     panels = [
-        ("prefill_compute (s)", series("prefill_compute")),
-        ("prefill_queue wait (s)", series("prefill_queue")),
-        ("kv_transfer = buffer wait (s)", series("kv_transfer")),
-        ("decode_queue wait (s) [usually dominant]", series("decode_queue")),
-        ("decode (s)", series("decode")),
-        ("TTFT (s)", series("ttft_recon")),
-        ("TPOT (s)", tpot_series()),
-        ("e2e = Σ stages (s) [perf_metrics recon]", series("e2e")),
-        ("e2e request time (s) [official client E2EL]", series("e2el")),
+        ("① 요청큐 대기 (초) — prefill 슬롯 대기", series("prefill_queue")),
+        ("② 온전한 prefill 시간 (초)", series("prefill_compute")),
+        ("③ KV캐시 전송큐 대기 (초) — 버퍼대기·보통 최대", series("decode_queue")),
+        ("④ 보내는 시간 (초) — KV 노드간 전송", series("kv_transfer")),
+        ("⑤ 온전한 decode 시간 (초)", series("decode")),
+        ("⑥ TTFT (초) — 도착→첫토큰 ≈ ①+②+③+④", series("ttft_recon")),
+        ("⑦ TPOT (초) — 토큰당 (=⑤÷(OSL-1))", tpot_series()),
+        ("⑧ e2e 요청시간 (초) — 공식 client E2EL", series("e2el")),
     ]
     x = np.arange(len(labels))
     w = 0.27
-    fig, axes = plt.subplots(3, 3, figsize=(20, 12))
-    fig.suptitle("latency decomposition per point — mean / p50 / p99  (perf_metrics, warmup-filtered; recon e2e ≈ official E2EL ⇒ split is trustworthy)")
+    fig, axes = plt.subplots(2, 4, figsize=(23, 10))
+    fig.suptitle("요청 지연 분해 — 포인트별 mean / p50 / p99 (perf_metrics, warmup 제외; 빨강계열=대기, 파랑계열=작업은 본문 표 참조)")
     for ax, (title, data) in zip(axes.flat, panels):
         m = [_num(d.get("mean")) for d in data]
         p5 = [_num(d.get("p50")) for d in data]
@@ -644,8 +653,8 @@ def plot_latency_decomp(all_stats: dict, out_dir: Path) -> None:
         ax.bar(x - w, m, w, label="mean")
         ax.bar(x, p5, w, label="p50")
         ax.bar(x + w, p9, w, label="p99")
-        ax.set_xticks(x); ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=6)
-        ax.set_title(title, fontsize=9); ax.legend(fontsize=6); ax.grid(axis="y", alpha=0.3)
+        ax.set_xticks(x); ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=7)
+        ax.set_title(title, fontsize=10); ax.legend(fontsize=7); ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     fname = out_dir / "compare_latency_decomp.png"
     fig.savefig(fname, dpi=120); plt.close(fig)
