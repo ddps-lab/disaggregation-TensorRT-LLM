@@ -268,7 +268,7 @@ class S3Syncer:
         # S3 저장 경로: s3://버킷/raw/custom/20260518/hostname/configA1/
         # "custom" prefix → 우리 하네스(sweep + benchmark_serving) 산출물 경로 구분용.
         # config 한 단계 더 → 같은 호스트에서 여러 config 결과 보관해도 안 섞임.
-        date = _dt.datetime.utcnow().strftime("%Y%m%d")
+        date = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d")
         host = socket.gethostname()
         self.dest = f"s3://{bucket}/raw/custom/{date}/{host}/{config}/"
         self._stop_event = threading.Event()
@@ -288,7 +288,7 @@ class S3Syncer:
         return None
 
     def _log(self, msg: str) -> None:
-        ts = _dt.datetime.utcnow().isoformat(timespec="seconds")
+        ts = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
         line = f"[{ts}] {msg}\n"
         try:
             with open(self._log_path, "a") as f:
@@ -443,7 +443,7 @@ async def main(args: argparse.Namespace) -> None:
             "generation": {"num_instances": num_gen, "tp": gen_tp, "pp": gen_pp},
             "placement": placement,
             "cache_transceiver_backend": cache_backend,
-            "start_time": _dt.datetime.utcnow().isoformat(),
+            "start_time": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "description": (
                 f"TRT-LLM PD-disagg benchmark — {config} "
                 f"(ctx {num_ctx}x tp{ctx_tp}pp{ctx_pp} / gen {num_gen}x tp{gen_tp}pp{gen_pp}, {placement})"
