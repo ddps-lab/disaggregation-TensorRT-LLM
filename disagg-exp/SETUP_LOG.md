@@ -122,6 +122,14 @@ git push -u origin disagg-exp/trtllm-v1.2.1        # push 완료
 - **변경 4곳**: ctx/gen extra YAML `cache_transceiver_config.backend: NIXL`(실제 결정), launch `CACHE_BACKEND` 기본 NIXL(정보성), 문서(CLAUDE 핀·스키마·LEARNING_NOTES KV백엔드·README env/디버그). **폴백=UCX** 명시.
 - **검증**: bash -n 통과. 런타임(NIXL이 컨테이너서 TCP로 실제 동작)은 GPU smoke에서 — 안 뜨면 backend를 UCX로 1줄 폴백.
 
+## 2026-06-23 (2) — 스케줄러 캡 상향: max_batch_size 256→512, max_num_tokens 8192→16384 (ctx·gen)
+- **이유**(사용자 제안): 배치 캡은 독립변수가 아니라 **통제변수** → "절대 안 걸릴 만큼 높게 + 전 config 동일"이 원칙. P/D·TP 확장 시 aggregate KV가 256 동시요청을 넘기면 256이 병목이 될 수 있어 선제 상향.
+- **기대치 정정(중요)**: `max_batch_size`는 **cap일 뿐 메모리 예약 아님**. 단일 L4(24GB)에선 decode 동시성을 **KV 풀(`free_gpu_memory_fraction:0.85`)이 먼저 묶음** — Qwen3-4B BF16·seq~2560이면 GPU 1장당 **~37동시**. → 1P1D 단일 GPU에선 256도 안 닿아 **512로 올려도 throughput 불변**. 512가 의미 있어지는 건 **D확장(xPyD)·decode TP/멀티GPU**로 aggregate KV가 커질 때.
+- **값 근거(grid 의존)**: sweep ISL 최대 2048, OSL 최대 512(`SWEEP_PD_PAIRS="2048,128;1024,512"`). ctx는 chunked OFF → `max_num_tokens >= ISL` 필수 → 16384=8×2048(prefill 배칭 헤드룸). gen은 iter당 ~batch 토큰 → `>= max_batch_size`면 충분(8192도 무방, 헤드룸용 상향).
+- **안 건드린 것**: `cache_transceiver_config.max_tokens_in_buffer`(8192)는 KV전송 버퍼라 **batch 아니라 ISL에 묶임** → 4×최대ISL로 이미 충분, 유지.
+- **변경 2곳**: `ctx_extra_llm_api_options.yaml`, `gen_extra_llm_api_options.yaml` (전 config 공유 → 자동으로 전 config 동일). CLAUDE/README 변인통제 항목은 "상향"으로 이미 개념 기술됨(구체값=YAML 단일소스).
+- **검증**: 정적 값 변경. 활성화 버퍼↑로 KV풀 약간↓ → **Phase 0 OOM 한계 체크 대상**(SETUP_LOG Phase 0 항목에 이미 등록). 실제 OOM/비병목 여부는 GPU smoke에서.
+
 ## 아직 안 한 것 / 주의 (코드에서 확정 못 함 → GPU에서)
 - 로컬에서 TRT-LLM **빌드/실행 안 함** (컨테이너로 원격에서). 코드 정확성은 정적, **동작 검증은 GPU**.
 - 컨테이너 `nvcr.io/nvidia/tensorrt-llm/release:1.2.1` 실제 pull·기동, Qwen3-4B 로드, KV전송 동작, 출력정확성(비분리 비교) = 전부 Phase 0.

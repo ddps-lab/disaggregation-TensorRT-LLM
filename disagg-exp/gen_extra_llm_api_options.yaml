@@ -12,8 +12,9 @@ attn_backend: TRTLLM
 enable_chunked_prefill: false
 disable_overlap_scheduler: false   # decode는 overlap 켜는 게 일반적
 cuda_graph_config: null            # CUDA Graph OFF (사용자 결정: 양쪽 균일 eager → 변인통제 + graph-capture cold-start 제거)
-max_batch_size: 256
-max_num_tokens: 8192
+max_batch_size: 512          # decode 동시성 레버(전 config 동일·"비병목" 목표). 256→512.
+                             #   ⚠️ 단일 GPU선 KV풀(free_gpu_memory_fraction)이 먼저 묶음(L4 seq~2560 → ~37동시) → 512는 D-TP/멀티GPU 확장 대비.
+max_num_tokens: 16384        # decode는 iter당 ~batch개 토큰 → max_num_tokens >= max_batch_size면 충분(8192도 무방). 헤드룸 위해 상향.
 
 # per-request perf 메트릭(KV전송시간 등) 수집 → orchestrator /perf_metrics로 노출 (analyze가 사용)
 return_perf_metrics: true

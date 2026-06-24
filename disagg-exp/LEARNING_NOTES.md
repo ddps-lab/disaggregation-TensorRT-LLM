@@ -270,6 +270,51 @@ vLLM은 각 노드 `/metrics`의 누적 토큰 카운터를 1초 차분해 per-s
 
 ---
 
+### 6.5 〔큰 그림 · 이해 먼저〕 "서버 띄우기" vs "부하 보내기" — 두 도구를 헷갈리지 말 것 (vLLM ↔ TRT-LLM)
+
+> 2026-06-23 추가. "왜 우리는 `trtllm-serve`가 아니라 `benchmark_serving`으로 호출하지?"라는 질문에서 출발한 정리.
+
+**벤치마크는 언제나 명령이 2개다:** ① 서버를 켠다 → ② 그 켜진 서버에 부하(요청)를 쏜다. 이 둘은 **서로 다른 프로그램**이고, 벤치하려면 **둘 다** 필요하다. (vLLM에서 하던 것과 똑같다 — 도구 이름만 다름.)
+
+**헷갈리는 진짜 이유 = 이름에 둘 다 "serve"가 들어가서다.** `serve`(서버 켜기)와 `bench serve`/`benchmark_serving`(부하 쏘기)는 글자만 비슷할 뿐 정반대 역할.
+
+| 역할 | vLLM | TRT-LLM (우리) | 우리 파일 |
+|---|---|---|---|
+| ① **서버 띄우기** | `vllm serve <model>` | `trtllm-serve` (disagg는 `trtllm-serve disaggregated`) | **`launch_trtllm.sh`** |
+| ② **부하 보내기/측정** | `vllm bench serve` (구 `benchmark_serving.py`) | `python -m tensorrt_llm.serve.scripts.benchmark_serving` | **`sweep.py`** (→ benchmark_serving 호출) |
+
+- TRT-LLM의 `benchmark_serving`은 **vLLM `benchmark_serving.py`를 포팅한 것** → `--request-rate`·`--burstiness`·`--random-input-len` 같은 플래그가 vLLM과 글자까지 동일. **즉 vLLM에서 쓰던 그 부하 도구가 거의 그대로 여기로 옴.**
+- disagg에선 ①(서버)이 사실 **프로세스 3개**(P 워커 + D 워커 + orchestrator)지만, ②(부하)는 **orchestrator 한 곳(:8000)만** 친다. 그래서 우리 `sweep.py`도 base-url 하나(:8000)만 친다.
+- 그래서 지난번 "공식 예제가 `trtllm-serve --config ...`로 부른다"는 건 ①(서버 = `launch_trtllm.sh`) 얘기였고, 우리가 `BENCH_MODULE = benchmark_serving`으로 부르는 건 ②(부하 = `sweep.py`) 얘기. **둘은 다른 단계이고, 우리는 양쪽 다 공식 그대로 쓴다.** (`--config`≡`--extra_llm_api_options`도 ①서버 플래그였음 — 부하와 무관.)
+
+#### closed-loop(`--max-concurrency C`) vs open-loop(`--request-rate R`) — "부하를 거는 두 방식"
+
+같은 부하 도구(`benchmark_serving`)라도 **요청을 흘려보내는 방식**이 두 가지다:
+
+| | closed-loop `--max-concurrency C` | open-loop `--request-rate R` (우리) |
+|---|---|---|
+| 비유 | **동시 손님 C명**: 각자 답 받으면 곧바로 다음 주문 | **초당 R명 도착**: 앞 손님 끝났든 말든 계속 들어옴 |
+| 진행 중 요청 수 | 항상 ≤ C (상한 고정) | 제한 없음 (서버 느리면 큐에 쌓임) |
+| **속도를 누가 정하나** | **서버**가 정함 (느리면 자동으로 천천히 = backpressure) | **우리**가 정함 (서버 속도와 무관하게 R개씩 주입) |
+| 드러나는 것 | 동시성 N일 때의 latency·throughput | **포화점/SLA 한계** (못 버티면 latency 폭증) |
+| 공식 예제 용법 | C=1,2,4,…,256 **스윕** → latency-throughput 곡선 | rate R을 올려가며 **언제 무너지나** |
+
+- 한 줄 요약: **closed-loop = "동시 N명이면 얼마나 빠른가"(서버가 페이스 결정), open-loop = "초당 N개 들어오면 버티나"(우리가 페이스 결정 → 포화/SLA 관찰).**
+- **우리가 `--request-rate`(+`--burstiness 1.0`=Poisson 도착)를 주로 쓰는 이유**: (1) 실제 서빙 트래픽이 사용자 독립 도착(Poisson)에 가까움, (2) rate를 올려 **SLA가 깨지는 포화점을 직접 찾는 것**이 이 실험 목적("SLA 하 throughput"), (3) PD 분리에서 P/D 각각 어느 rate에서 먼저 병목인지 봐야 함. → request-rate가 주(主), `--max-concurrency` 미설정(동시연결 무제한). 깨끗한 곡선이 필요하면 concurrency 스윕도 보조로 가능(둘 다 benchmark_serving 내장).
+
+#### 챙길 플래그 1개 — `trust_remote_code` (서버·부하 **양쪽**)
+
+- **뭐냐**: HuggingFace 모델을 로드할 때 그 repo에 함께 든 **커스텀 파이썬 코드(모델/토크나이저 정의)를 실행하도록 허용**하는 스위치. 기본 OFF(보안 — 임의 코드 실행 차단).
+- **언제 필요**: 모델이 transformers에 정식 편입 전이거나 커스텀 아키/토크나이저면 이 코드가 있어야 로드됨.
+- **(정정) 서버만의 플래그가 아니다 — 양쪽에 있다** (v1.2.1 소스 확인):
+  - **서버**: `trtllm-serve --trust_remote_code` (**밑줄**) — 모델+토크나이저 로드 (`tensorrt_llm/commands/serve.py:393,600`)
+  - **부하**: `benchmark_serving --trust-remote-code` (**하이픈!**) — **클라이언트 토크나이저 로드용**. 우리가 `--tokenize-on-client`를 쓰므로 부하 도구도 토크나이저를 직접 읽음 (`benchmark_serving.py:710-712 get_tokenizer(..., trust_remote_code=args.trust_remote_code)`)
+- **공식 disagg 벤치는 둘 다 켠다**: `examples/disaggregated/slurm/benchmark/config.yaml:89,118 trust_remote_code: true`(서버 워커) + `run_benchmark.sh:65 --trust-remote-code`(부하).
+- **Qwen3-4B는?** 보통 **standard**(transformers/TRT-LLM 정식 지원, `modeling_qwen3.py` 존재) → 없어도 대개 로드됨. 단 무해(공식 신뢰 가중치) + 공식 예제와 일치 + 로드 안정성 → **양쪽에 넣길 권장**.
+- **우리 현재 상태(미적용)**: `launch_trtllm.sh`(서버)에 없음, `sweep.py`(부하)도 `--trust-remote-code` 안 넘김(`--tokenize-on-client`만 있음). → **추가 권장 항목**(이번엔 기록만, 적용 X). smoke에서 정확한 스펠링은 `trtllm-serve --help`로 최종 확인.
+
+---
+
 ### 7. 부하/측정 도구 — 공식 최대 + per-side만 커스텀 (vLLM 공식 벤치 브랜치 철학)
 
 - **공식 부하 도구**: `python -m tensorrt_llm.serve.scripts.benchmark_serving` — vLLM `benchmark_serving.py`의 fork, **공식 disagg slurm 벤치(`examples/disaggregated/slurm/benchmark/run_benchmark.sh`)가 호출**. orchestrator :8000 OpenAI를 침. token-id ISL 고정(`--random-ids --tokenize-on-client --random-range-ratio 0`)·`--ignore-eos`·OSL(`--random-output-len`)·Poisson(`--request-rate --burstiness 1.0`)·`--max-concurrency` 지원.

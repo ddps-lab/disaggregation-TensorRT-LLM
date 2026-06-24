@@ -15,8 +15,10 @@ attn_backend: TRTLLM         # FlashInfer 금지(비대칭 TP 오출력 #6507). 
 enable_chunked_prefill: false   # prefill 한 번에 = compute-bound 측정 (변인통제)
 disable_overlap_scheduler: true # context 표준(overlap 미지원)
 cuda_graph_config: null      # ctx는 decode graph 불필요 → 메모리 절약 (명시적 null = OFF)
-max_batch_size: 256          # 큐 병목 제거(전 config 동일). max_batch_size <= max_num_tokens 필수
-max_num_tokens: 8192
+max_batch_size: 512          # 큐 병목 제거(전 config 동일·"비병목" 목표). max_batch_size <= max_num_tokens 필수.
+                             #   P/D·TP 확장 시 aggregate KV가 256 동시요청을 넘길 수 있어 상향(256→512). cap일 뿐 메모리 예약 아님.
+max_num_tokens: 16384        # ctx는 chunked OFF → 한 iter에 prompt 통째 → max_num_tokens >= ISL(grid 최대 2048) 필수.
+                             #   16384 = 8×2048 → prefill 다중 프롬프트 배칭 헤드룸. (활성화 버퍼↑ → KV풀 약간↓, Phase0 OOM 체크 대상)
 
 # per-request perf 메트릭(KV전송시간 등) 수집 → orchestrator /perf_metrics로 노출 (analyze가 사용)
 return_perf_metrics: true
