@@ -33,9 +33,10 @@ LOG_DIR="${EXP_LOG_DIR:-./results}"
 INTERVAL="${S3_SYNC_INTERVAL:-30}"
 ACTION="${1:-start}"
 
-mkdir -p "$LOG_DIR"
-PIDFILE="$LOG_DIR/.pid_telemetry_sync"
-SYNC_LOG="$LOG_DIR/s3_sync.log"
+TELE_DIR="$LOG_DIR/telemetry"   # sync 로그·pid는 telemetry/로 (results 루트 정리)
+mkdir -p "$TELE_DIR"
+PIDFILE="$TELE_DIR/.pid_telemetry_sync"
+SYNC_LOG="$TELE_DIR/s3_sync.log"
 
 # s5cmd(빠름) 우선, 없으면 aws cli 폴백 — 둘 다 `<cmd> sync SRC DEST` 형태(S3Syncer와 동일).
 _pick_cmd() {

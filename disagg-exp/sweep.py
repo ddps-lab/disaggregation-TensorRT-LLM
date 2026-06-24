@@ -276,8 +276,9 @@ class S3Syncer:
         self._final_done = False
         self._lock = threading.Lock()
         self._cmd = self._pick_cmd()  # s5cmd 또는 aws cli 자동 탐색
-        self._log_path = Path(log_dir) / "s3_sync.log"
-        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        tele = Path(log_dir) / "telemetry"   # s3 동기화 로그는 telemetry/로 (results 루트 정리)
+        tele.mkdir(parents=True, exist_ok=True)
+        self._log_path = tele / "s3_sync.log"
 
     @staticmethod
     def _pick_cmd() -> list[str] | None:

@@ -13,7 +13,8 @@
 set -euo pipefail
 
 LOG_DIR="${EXP_LOG_DIR:-./results}"
-mkdir -p "$LOG_DIR"
+TELE_DIR="$LOG_DIR/telemetry"   # 노드 텔레메트리(nvidia-smi·ifstat·dcgm·clock·pid)는 여기로 (results 루트 정리)
+mkdir -p "$LOG_DIR" "$TELE_DIR"
 PY="${PYTHON:-python3}"
 # 컨테이너는 보통 root → sudo 불필요/부재. 있으면 쓰고 없으면 그냥 실행.
 if command -v sudo &>/dev/null; then SUDO="sudo"; else SUDO=""; fi
@@ -64,7 +65,7 @@ if ! command -v chronyc &>/dev/null && ! command -v chronyd &>/dev/null; then
     $SUDO apt-get update -qq 2>/dev/null || true   # ifstat에서 안 돌았을 수 있어 한 번 더(idempotent)
     $SUDO apt-get install -y -q chrony 2>/dev/null || echo "[setup] WARN: apt install chrony 실패 — date 기반 baseline으로 폴백"
 fi
-CLOCK_BASE="$LOG_DIR/clock_baseline_$(hostname).txt"
+CLOCK_BASE="$TELE_DIR/clock_baseline_$(hostname).txt"
 # chronyd는 /usr/sbin에 설치돼 root PATH에 없을 수 있어 명시 경로도 확인.
 CHRONYD_BIN="$(command -v chronyd 2>/dev/null || true)"
 [[ -z "$CHRONYD_BIN" && -x /usr/sbin/chronyd ]] && CHRONYD_BIN=/usr/sbin/chronyd
@@ -90,15 +91,15 @@ echo "[setup] clock baseline → $CLOCK_BASE"
 if ! curl -sf "http://localhost:9400/metrics" 2>/dev/null | grep -q DCGM_FI; then
     if command -v dcgm-exporter &>/dev/null; then
         nohup dcgm-exporter -f /etc/dcgm-exporter/default-counters.csv \
-            -a ":9400" >> "$LOG_DIR/dcgm_exporter.log" 2>&1 &
+            -a ":9400" >> "$TELE_DIR/dcgm_exporter.log" 2>&1 &
         echo "[setup] started dcgm-exporter (pid $!)"
     fi
 fi
 
 # ── 6. background metric collectors (1Hz GPU/NIC 기록) ───────────────────────
-PIDFILE_DMON="$LOG_DIR/.pid_nvidia_dmon"
-PIDFILE_IFSTAT="$LOG_DIR/.pid_ifstat"
-PIDFILE_DCGM="$LOG_DIR/.pid_dcgm_loop"
+PIDFILE_DMON="$TELE_DIR/.pid_nvidia_dmon"
+PIDFILE_IFSTAT="$TELE_DIR/.pid_ifstat"
+PIDFILE_DCGM="$TELE_DIR/.pid_dcgm_loop"
 
 _kill_pid_file() {
     local pf="$1"
@@ -116,7 +117,7 @@ pkill -f "ifstat -t" 2>/dev/null || true
 
 # nvidia-smi dmon: 1Hz, Power|Util|SM Clk|Memory (컨테이너서도 --gpus all이면 동작)
 nohup nvidia-smi dmon -s pucvmet -d 1 -o DT \
-    > "$LOG_DIR/nvidia_smi.csv" 2>&1 &
+    > "$TELE_DIR/nvidia_smi.csv" 2>&1 &
 echo $! > "$PIDFILE_DMON"
 echo "[setup] nvidia-smi dmon pid=$(cat "$PIDFILE_DMON")"
 
@@ -124,7 +125,7 @@ echo "[setup] nvidia-smi dmon pid=$(cat "$PIDFILE_DMON")"
 if command -v ifstat &>/dev/null; then
     IFACE=$(ip route get 1 2>/dev/null | awk '/dev/{print $5;exit}')
     nohup ifstat -t -i "${IFACE:-eth0}" 1 \
-        > "$LOG_DIR/ifstat.csv" 2>&1 &
+        > "$TELE_DIR/ifstat.csv" 2>&1 &
     echo $! > "$PIDFILE_IFSTAT"
     echo "[setup] ifstat pid=$(cat "$PIDFILE_IFSTAT")"
 else
@@ -137,8 +138,8 @@ if curl -sf "http://localhost:9400/metrics" 2>/dev/null | grep -q DCGM_FI; then
     (while true; do
         curl -sf "http://localhost:9400/metrics" \
             | grep -E "DCGM_FI_DEV_(FB_USED|GPU_UTIL|SM_OCCUPANCY|POWER_USAGE|DRAM_ACTIVE|MEM_COPY_UTILIZATION)" \
-            >> "$LOG_DIR/dcgm.log" 2>/dev/null
-        echo "---" >> "$LOG_DIR/dcgm.log"
+            >> "$TELE_DIR/dcgm.log" 2>/dev/null
+        echo "---" >> "$TELE_DIR/dcgm.log"
         sleep 2
     done) &
     echo $! > "$PIDFILE_DCGM"

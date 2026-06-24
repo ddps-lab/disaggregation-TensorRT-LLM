@@ -29,7 +29,8 @@ CTX_EXTRA="${CTX_EXTRA:-$SCRIPT_DIR/ctx_extra_llm_api_options.yaml}"   # context
 GEN_EXTRA="${GEN_EXTRA:-$SCRIPT_DIR/gen_extra_llm_api_options.yaml}"   # generation 워커 변인통제 YAML
 SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-1800}"   # orchestrator -t (초). 대형모델 안전
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-1800}"             # orchestrator -r (초)
-mkdir -p "$LOG_DIR"
+LOGS_DIR="$LOG_DIR/logs"   # 서버 stdout/stderr 로그·생성 disagg yaml은 여기로 (results 루트 정리)
+mkdir -p "$LOG_DIR" "$LOGS_DIR"
 
 export PYTHONHASHSEED="${PYTHONHASHSEED:-123}"
 # Ethernet(EFA 없음) 노드용. NVLink 없는 g5/g6/g6e PCIe intra-node에도 안전.
@@ -124,7 +125,7 @@ _worker_exec() {
     --extra_llm_api_options "$extra"
 }
 
-_worker_log() { echo "$LOG_DIR/trtllm_${LABEL}_${1}_p${2}_$(hostname).log"; }   # role port
+_worker_log() { echo "$LOGS_DIR/trtllm_${LABEL}_${1}_p${2}_$(hostname).log"; }   # role port
 
 # 백그라운드 기동 (로그 파일로) → PID 반환. 'all' 모드 + 다중워커의 非마지막용.
 launch_worker() {  # role tp pp port gpus extra
@@ -237,7 +238,7 @@ run_role_fg() {  # role(context|generation)
 }
 
 start_proxy() {
-  local cfg="$LOG_DIR/disagg_${LABEL}.yaml"
+  local cfg="$LOGS_DIR/disagg_${LABEL}.yaml"
   write_disagg_yaml "$cfg"
   echo "[launch] orchestrator → ${PROXY_HOST}:${PROXY_PORT}  (cfg=$cfg)"
   # exec 안 씀 — 'all' 모드의 EXIT trap(워커 정리)이 동작하도록 포그라운드 실행
@@ -246,7 +247,7 @@ start_proxy() {
     -t "$SERVER_START_TIMEOUT" \
     -r "$REQUEST_TIMEOUT" \
     -l "$LOG_LEVEL" \
-    2>&1 | tee "$LOG_DIR/trtllm_${LABEL}_proxy_$(hostname).log"
+    2>&1 | tee "$LOGS_DIR/trtllm_${LABEL}_proxy_$(hostname).log"
 }
 
 case "$ROLE" in
