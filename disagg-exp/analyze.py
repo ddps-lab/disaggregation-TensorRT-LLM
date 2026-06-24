@@ -324,7 +324,7 @@ def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
     3패널 시계열을 그 config 폴더에 저장:
       ① 동시 배치수(prefill/decode)가 시간에 따라 어떻게 변하나
       ② backlog = prefill 끝났는데 decode 대기 중인 요청수(프리필 큐에 쌓인 양)
-      ③ 누적 완료수(ctx=prefill, gen=decode) — 총 처리가 어떻게 진행되나
+      ③ 이 실험 완료수(0부터, 누적 아님) — 총 처리가 어떻게 진행되나
     (배치수는 enable_iter_perf_stats:true여야 채워짐. null이면 그 패널만 'n/a' 표시.)"""
     if not HAS_MPLOT:
         return
@@ -383,12 +383,12 @@ def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
     cx, cy = xy("prefill_done", "ctx_done")
     gx, gy = xy("decode_done", "gen_done")
     if cx:
-        ax.plot(cx, cy, marker=".", label="ctx_done (prefill, cumulative)")
+        ax.plot(cx, cy, marker=".", label="prefill_done (this run)")
     if gx:
-        ax.plot(gx, gy, marker=".", linestyle="--", label="gen_done (decode, cumulative)")
+        ax.plot(gx, gy, marker=".", linestyle="--", label="decode_done (this run)")
     if cx or gx:
         ax.legend(fontsize=8)
-    ax.set_title("cumulative completions (slope = rps)"); ax.set_xlabel("t (s)"); ax.set_ylabel("requests")
+    ax.set_title("completions this run (slope = rps)"); ax.set_xlabel("t (s)"); ax.set_ylabel("requests")
 
     fig.tight_layout()
     fname = config_dir / f"{F_LIVE}_{point_id}.png"

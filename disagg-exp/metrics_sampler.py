@@ -45,6 +45,8 @@ class BatchSampler:
         self._backlog = []                  # (ctx_completed - gen_completed) 샘플 = 쌓인 수
         self._last_ctx = None
         self._last_gen = None
+        self._ctx0 = None                   # 측정 시작 시점 누적값(baseline) → 완료수를 이 실험 기준 0부터로
+        self._gen0 = None
         self._tick = 0
         self.trace = []                     # 매 tick 스냅샷(라이브 기록) → live_<point>.jsonl로 저장
 
@@ -79,17 +81,27 @@ class BatchSampler:
             return
         ctx, gen = snap.get("ctx"), snap.get("gen")
         if isinstance(ctx, (int, float)) and isinstance(gen, (int, float)):
-            self._backlog.append(ctx - gen)
+            if self._ctx0 is None:          # 첫 유효 샘플 = 이 실험의 baseline(완료수 0 기준점)
+                self._ctx0, self._gen0 = ctx, gen
+            self._backlog.append(ctx - gen)  # 차이라 baseline 무관(현재 outstanding)
             self._last_ctx, self._last_gen = ctx, gen
 
     def _last_batch(self, side: str):
         rows = self._samples.get(side) or []
         return rows[-1]["batch"] if rows else None
 
+    @staticmethod
+    def _rel(val, base):
+        """누적 카운터를 이 실험 시작(baseline) 기준 상대값으로. = 이 실험에서 완료한 수."""
+        if isinstance(val, (int, float)) and isinstance(base, (int, float)):
+            return val - base
+        return None
+
     def _print_live(self) -> None:
         bl = self._backlog[-1] if self._backlog else None
         secs = self._tick * self._interval
-        print(f"  [live +{secs:.0f}s] prefill_done={self._last_ctx} decode_done={self._last_gen} "
+        print(f"  [live +{secs:.0f}s] prefill_done={self._rel(self._last_ctx, self._ctx0)} "
+              f"decode_done={self._rel(self._last_gen, self._gen0)} "
               f"backlog={bl} | prefill_batch={self._last_batch('prefill')} decode_batch={self._last_batch('decode')}",
               file=sys.stderr, flush=True)
 
@@ -99,7 +111,9 @@ class BatchSampler:
             await self._poll_backlog()
             self.trace.append({                       # 라이브 기록(매 tick) — timeseries_<point>.jsonl
                 "t": round(self._tick * self._interval, 1),
-                "prefill_done": self._last_ctx, "decode_done": self._last_gen,   # 누적 완료수(ctx/gen)
+                # 완료수는 이 실험 시작 기준 0부터(누적 아님) — 실험별로 따로 보게.
+                "prefill_done": self._rel(self._last_ctx, self._ctx0),
+                "decode_done": self._rel(self._last_gen, self._gen0),
                 "backlog": (self._backlog[-1] if self._backlog else None),       # prefill끝·decode대기 수
                 "prefill_batch": self._last_batch("prefill"),                    # 그 순간 동시 배치수
                 "decode_batch": self._last_batch("decode"),
