@@ -1,0 +1,30 @@
+{
+  "_legend": {
+    "\ucd9c\ucc98": "batch\u00b7kv = \uc6cc\ucee4 /metrics (inflightBatchingStats/kvCacheStats), backlog = orchestrator ctx/gen_completed \uce74\uc6b4\ud130 \ucc28. \ubaa8\ub450 1Hz \uc0d8\ud50c.",
+    "{side}_batch_mean": "\ub3d9\uc2dc \ubc30\uce58\uc218 \ud3c9\uade0 (idle 0 \ud3ec\ud568 = \uc810\uc720\uc728 \uad00\uc810)",
+    "{side}_batch_mean_active": "\ub3d9\uc2dc \ubc30\uce58\uc218 \ud3c9\uade0 (idle 0 \uc81c\uc678 = \ucc98\ub9ac \uc911\uc77c \ub54c\ub9cc). \ud45c prefill_batch/decode_batch\uac00 \uc774\uac83",
+    "{side}_batch_max": "\uad00\uce21\ub41c \ucd5c\ub300 \ub3d9\uc2dc \ubc30\uce58\uc218",
+    "{side}_active_frac": "batch>0(\ubc14\uc05c) \uc0d8\ud50c \ube44\uc728 0~1 (\ud45c *_busy% = \u00d7100)",
+    "{side}_kv_used_frac_mean/max": "KV\ud480 \uc0ac\uc6a9\ub960 usedNumBlocks/maxNumBlocks \ud3c9\uade0/\ucd5c\ub300 (\ud45c decode_kv% = \u00d7100)",
+    "{side}_n_samples": "\uadf8 \uce21\uba74 1Hz \uc0d8\ud50c \uac1c\uc218",
+    "backlog_mean/max": "(ctx_completed - gen_completed) \ud3c9\uade0/\ucd5c\ub300 = prefill \ub05d\ub0ac\ub294\ub370 decode \uc544\uc9c1 \uc548 \ub05d\ub09c \uc694\uccad\uc218",
+    "backlog_n_samples": "backlog \uc0d8\ud50c \uac1c\uc218"
+  },
+  "prefill_n_samples": 580,
+  "prefill_batch_mean": 1.0344827586206897,
+  "prefill_batch_mean_active": 1.0344827586206897,
+  "prefill_batch_max": 5,
+  "prefill_active_frac": 1.0,
+  "prefill_kv_used_frac_mean": 0.913740210547868,
+  "prefill_kv_used_frac_max": 0.9816922315685305,
+  "decode_n_samples": 8012,
+  "decode_batch_mean": 4.792436345481778,
+  "decode_batch_mean_active": 4.792436345481778,
+  "decode_batch_max": 7,
+  "decode_active_frac": 1.0,
+  "decode_kv_used_frac_mean": 0.8928778405869671,
+  "decode_kv_used_frac_max": 0.9901039089559623,
+  "backlog_mean": 31.554545454545455,
+  "backlog_max": 37.0,
+  "backlog_n_samples": 110
+}

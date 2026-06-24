@@ -220,10 +220,8 @@ async def run_point(
         # per-side 배치수·KV 샘플러: measured 동안만 워커 /metrics 폴링 (warmup 제외=변인통제)
         sampler = None
         if batch_out is not None and WORKER_METRICS_EPS:
-            sampler = metrics_sampler.BatchSampler(
-                session, WORKER_METRICS_EPS,
-                interval=float(os.environ.get("SWEEP_SAMPLE_INTERVAL", "1.0")),  # 재실험 때 0.5로 촘촘히(크래시 경계)
-                orchestrator_url=base_url, live=LIVE)
+            sampler = metrics_sampler.BatchSampler(session, WORKER_METRICS_EPS, interval=1.0,
+                                                   orchestrator_url=base_url, live=LIVE)
             sampler.start()
         measured_args = build_bench_args(base_url, prefill_len, decode_len, rate,
                                          MEASURED_N, out_dir, result_filename, streaming=True)

@@ -1,0 +1,21 @@
+{
+  "config": "T1",
+  "framework": "tensorrt-llm",
+  "version": "1.2.1",
+  "model": "Qwen/Qwen3-4B",
+  "load_tool": "benchmark_serving",
+  "context": {
+    "num_instances": 1,
+    "tp": 1,
+    "pp": 1
+  },
+  "generation": {
+    "num_instances": 1,
+    "tp": 1,
+    "pp": 1
+  },
+  "placement": "inter",
+  "cache_transceiver_backend": "UCX",
+  "start_time": "2026-06-24T18:26:58.532936+00:00",
+  "description": "TRT-LLM PD-disagg benchmark \u2014 T1 (ctx 1x tp1pp1 / gen 1x tp1pp1, inter)"
+}

@@ -147,7 +147,6 @@ class BatchSampler:
                 "backlog": (self._backlog[-1] if self._backlog else None),       # prefill끝·decode대기 수(buffer)
                 "prefill_batch": self._last_batch("prefill"),                    # 그 순간 동시 배치수
                 "decode_batch": self._last_batch("decode"),
-                "prefill_kv_frac": self._last_kv_frac("prefill"),                # context KV풀 사용률 0~1 (Q1 backpressure 핵심 신호)
                 "decode_kv_frac": self._last_kv_frac("decode"),                  # decode KV풀 사용률 0~1(시계열 패널②)
             })
             if self._live and self._tick % self._live_every == 0:
