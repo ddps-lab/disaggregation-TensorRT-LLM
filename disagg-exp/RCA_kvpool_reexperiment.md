@@ -41,5 +41,33 @@
 - **Q1 CONFIRMED** ⟺ Phase A backlog 평평 구간에 (break 카운터 firing) **AND** ctx used/max ≈ 0.997 **AND** 같은 샘플에서 pending_queue>0 인데 admitted=0. → prefill이 ctx-KV로 실제 막힘. 반대로 admitted>0·break 없음이면 "ctx-full로 멈춘다"는 **falsified**(그냥 decode에 rate-matching).
 - **Q2 RESOLVED** by Phase B: gen 정책이 GUARANTEED_NO_EVICT이고 예약이 풀-출력(128+2048)이면 over-admit설은 확정 거짓 → 크래시 발생 시 규칙4의 발생 라인이 **진짜 메커니즘**을 지목(예약 밖 할당). 크래시 안 나고 :1037 경고만 뜨며 backpressure하면 → 이 빌드선 p128_d2048이 크래시 안 함(원래 크래시는 다른 config였다는 뜻). admitted gen-init수 vs `floor(maxNumBlocks / ceil(2176/tokensPerBlock))`를 경고/assert 순간에 같이 찍어 과/저구독 정량화.
 
+## 실행 커맨드 (복붙 — 원격 EC2에서)
+하니스는 이미 resume(`.done`/`.failed` 마커)·양쪽 KV trace(`prefill_kv_frac`/`decode_kv_frac`)를 지원.
+```bash
+# 0) (선택) 크래시 경계 빨리 도달: ctx/gen yaml의 free_gpu_memory_fraction 낮춰 pool 작게.
+#    measure 수도 줄여 빨리: export SWEEP_MEASURED_N=120
+#    KV/큐 더 촘촘히 보려면: export SWEEP_SAMPLE_INTERVAL=0.5   (기본 1.0s)
+
+# 1) 양쪽 워커 DEBUG 로그 ON (스케줄러/KV/경고/assert가 워커 로그에 찍히게)
+export LOG_LEVEL=debug
+export TLLM_LOG_LEVEL=debug
+# (KV전송 의심되면) export UCX_LOG_LEVEL=debug
+
+# 2) 서버 기동 (워커 로그 → $LOG_DIR/logs/trtllm_*_{ctx,gen}_*.log 로 자동 분리 저장)
+bash launch_trtllm.sh ...        # 평소처럼 (ctx 노드 / gen 노드 각각)
+
+# 3) sweep 재실행 — .done 있는 포인트는 자동 skip(=중단점부터 재개).
+#    크래시했던 decode-heavy는 마커 지워 강제 재시도:
+rm -f results/<CONFIG>/.failed_p128_d2048_*  results/<CONFIG>/.done_p128_d2048_*
+python3 sweep.py ...             # p1024_d512(Q1) 와 p128_d2048(Q2) 둘 다 포함되게
+
+# 4) 원인 자동 추출 (워커 로그 + trace에서 Q1/Q2 신호)
+python3 diagnose_run.py --log-dir <그 런의 LOG_DIR>
+python3 analyze.py --log-dir results --configs <CONFIG> --plot   # timeseries에 ctx KV·요청큐 패널 채워짐
+```
+`diagnose_run.py`가 출력: gen 정책(GUARANTEED_NO_EVICT?), "may not have enough kvCache" 경고 횟수,
+크래시 assert 발생부(kvCacheManager.cpp:1584 vs :1508 vs :1732 → 진짜 메커니즘), 그리고
+backlog 평탄 구간의 `ctx_kv` / `prefill_queue` 로 **Q1 자동 판정**(ctx_kv≈1 & 큐>0 ⇒ CONFIRMED).
+
 ## 수정 방향(코드 픽스, 참고)
 decode admission을 풀-시퀀스 블록 예산으로 캡(예: d2048이면 ~29) **또는** gen→ctx backpressure를 *decode* free-block 기준으로(현재 ctx free-block 기준). — 단 이건 RCA 확정 후.
