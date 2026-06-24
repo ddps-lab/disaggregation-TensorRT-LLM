@@ -182,6 +182,7 @@ def load_perf_breakdown(config_dir: Path, point_id: str) -> dict:
     if not isinstance(data, list):
         return {}
     cols: dict = {k: [] for k in _PERF_STAGES}
+    ctx_done, gen_done = [], []   # 절대 완료시각: prefill=ctx 첫토큰, decode=gen 마지막토큰 → per-side 완료율
     reused = missed = 0
     WARMUP_DECODE_MAX_S = 1.0   # warmup(decode 8토큰)≈0.3s → 측정(decode≥수초)만 채택
     for e in data:
@@ -194,7 +195,10 @@ def load_perf_breakdown(config_dir: Path, point_id: str) -> dict:
         if (glt - gft) <= WARMUP_DECODE_MAX_S:   # warmup 제외
             continue
         cols["decode"].append(glt - gft)
+        gen_done.append(glt)                       # decode 완료시각(이 요청이 끝난 절대시각)
         ca, cfs, cft = ctx.get("arrival_time"), ctx.get("first_scheduled_time"), ctx.get("first_token_time")
+        if isinstance(cft, (int, float)):
+            ctx_done.append(cft)                   # prefill 완료시각(첫토큰=KV 준비 완료)
         ga, gfs = gen.get("arrival_time"), gen.get("first_scheduled_time")
         ts, te = gen.get("kv_cache_transfer_start"), gen.get("kv_cache_transfer_end")
         da, dft = e.get("disagg_server_arrival_time"), e.get("disagg_server_first_token_time")
@@ -224,6 +228,18 @@ def load_perf_breakdown(config_dir: Path, point_id: str) -> dict:
     out["kv_transfer_s"] = out.get("kv_transfer_p50_s")
     out["decode_stage_s"] = out.get("decode_p50_s")
     out["e2e_stage_s"] = out.get("e2e_p50_s")
+    # per-side 완료율(req/s) = 그 측이 끝낸 요청수 ÷ (첫완료~끝완료 구간). 1P1D라도 prefill이
+    #   더 좁은 구간에 끝내므로 prefill_done_rps > decode_done_rps → decode가 병목임이 드러남.
+    if len(ctx_done) >= 2:
+        span = max(ctx_done) - min(ctx_done)
+        if span > 0:
+            out["prefill_done_rps"] = len(ctx_done) / span
+    if len(gen_done) >= 2:
+        span = max(gen_done) - min(gen_done)
+        if span > 0:
+            out["decode_done_rps"] = len(gen_done) / span
+    if "prefill_done_rps" in out and "decode_done_rps" in out:
+        out["prefill_minus_decode_done_rps"] = out["prefill_done_rps"] - out["decode_done_rps"]
     if reused + missed:
         out["block_reuse_ratio"] = reused / (reused + missed)
     return {k: v for k, v in out.items() if v is not None}
@@ -355,10 +371,10 @@ _TABLE_GROUPS = [
     ("③ 처리량", [
         ("output_tokens_per_sec", "out_tok_s", 0, 1),
     ]),
-    ("④ prefill vs decode 완료 속도·차이 (측정창 평균, [계산]) — 차이>0이면 decode가 못 따라가 backlog 쌓임", [
-        ("prefill_completed_reqs_per_sec", "prefill_rps", 0, 3),
-        ("decode_completed_reqs_per_sec", "decode_rps", 0, 3),
-        ("prefill_minus_decode_per_sec", "accum_rps", 0, 3),
+    ("④ prefill vs decode 요청 완료율·차이 (perf_metrics 절대 완료시각, [계산]) — prefill>decode면 decode가 병목·backlog 쌓임", [
+        ("prefill_completion_rate_per_sec", "prefill_done_rps", 0, 3),
+        ("decode_completion_rate_per_sec", "decode_done_rps", 0, 3),
+        ("prefill_minus_decode_completion_per_sec", "prefill_minus_decode_done_rps", 0, 3),
         ("prefill_tokens_per_sec_approx", "prefill_tps", 0, 0),
         ("decode_tokens_per_sec_approx", "decode_tps", 0, 0),
     ]),
@@ -398,11 +414,12 @@ def metric_glossary() -> str:
         "tpot_median_s                 [공식] 토큰당 시간(첫토큰 제외, median). ※E2E ≈ ttft + tpot×출력토큰수",
         "e2e_client_p99_s              [공식] 요청 끝까지 (99퍼센타일)",
         "output_tokens_per_sec         [공식] 생성토큰 합 / 측정시간",
-        "[③ prefill vs decode 완료 속도·차이 — orchestrator 완료 카운터 / 실제 부하시간(bench duration)]",
-        "  ※분모=benchmark_serving 'duration'(main run 실측). prom window는 startup·초기테스트 포함해 길어 rps 희석 → 이걸로 보정.",
-        "prefill_completed_reqs_per_sec [계산] (측정후−측정전 ctx_completed)/부하시간 = prefill이 초당 끝낸 요청수",
-        "decode_completed_reqs_per_sec  [계산] (측정후−측정전 gen_completed)/부하시간 = decode가 초당 끝낸 요청수",
-        "prefill_minus_decode_per_sec   [계산] 위 둘의 차이 = backlog 쌓이는 속도 (양수=decode가 못 따라감)",
+        "[③ prefill vs decode 요청 완료율·차이 — perf_metrics 절대 완료시각 기반(per-request)]",
+        "  ※prefill 완료=ctx 첫토큰(KV 준비됨), decode 완료=gen 마지막토큰. 각 측의 '첫완료~끝완료 구간'으로 나눔.",
+        "  ※1P1D라도 prefill이 더 좁은 구간에 다 끝내므로 prefill>decode로 갈라짐 → decode가 율속(병목)임이 드러남.",
+        "prefill_completion_rate_per_sec [계산] prefill 끝낸 요청수 ÷ (prefill 첫완료~끝완료 구간) = prefill이 초당 끝낸 요청수",
+        "decode_completion_rate_per_sec  [계산] decode 끝낸 요청수 ÷ (decode 첫완료~끝완료 구간) = decode가 초당 끝낸 요청수",
+        "prefill_minus_decode_completion_per_sec [계산] 위 둘의 차이 = prefill이 decode보다 빠른 정도(양수=decode 병목)",
         "prefill_tokens_per_sec_approx  [계산·근사] prefill_completed × 입력길이(ISL). ※토큰 카운터 없어 곱셈 근사",
         "decode_tokens_per_sec_approx   [계산·근사] decode_completed × 출력길이(OSL)",
         "[④ 동시처리·KV·대기 — 워커 /metrics, 1Hz 샘플. mean=평균(ramp/idle 희석), max=peak(천장)]",
@@ -459,7 +476,7 @@ _HEADLINE = [
     ("output_tokens_per_sec", "out_tok_s", 1),
     ("decode_concurrent_reqs_mean", "dc_bsz", 1),
     ("backlog_waiting_reqs_mean", "backlog", 1),
-    ("prefill_minus_decode_per_sec", "accum_rps", 3),
+    ("prefill_minus_decode_completion_per_sec", "prefill_minus_decode_done_rps", 3),
 ]
 
 
@@ -662,8 +679,9 @@ def plot_latency_decomp(all_stats: dict, out_dir: Path) -> None:
 
 
 def plot_perside_compare(all_stats: dict, out_dir: Path) -> None:
-    """[compare #2] 모든 포인트의 per-side 처리량·동시성: prefill/decode rps, batch(mean+max), backlog(mean+max).
-    1P1D에선 prefill_rps==decode_rps(=orchestrator 집계=단일 워커). batch는 mean_active 막대 + max 수염."""
+    """[compare #2] 포인트별 per-side 처리량·동시성: ①요청 완료율(prefill vs decode) ②동시배치 ③backlog.
+    완료율은 perf_metrics 절대 완료시각 기반(prefill=ctx 첫토큰, decode=gen 마지막토큰)이라 1P1D라도
+    prefill이 더 좁은 구간에 끝내 prefill>decode로 갈라짐(=decode 병목). batch는 활성평균 막대 + max 수염."""
     if not HAS_MPLOT:
         return
     pts = [(c, p) for c in sorted(all_stats) for p in sorted(all_stats[c])]
@@ -680,31 +698,31 @@ def plot_perside_compare(all_stats: dict, out_dir: Path) -> None:
                 ax.plot(xi, b, marker="_", color="k")
 
     fig, axes = plt.subplots(1, 3, figsize=(20, 5))
-    fig.suptitle("per-side throughput & concurrency per point")
+    fig.suptitle("포인트별 per-side 처리량 · 동시성")
     w = 0.38
-    # A: per-side completed rps
+    # A: per-side 완료율 (prefill이 요청 끝내는 속도 vs decode가 끝내는 속도)
     ax = axes[0]
-    pf = [g(c, p, "prefill_rps") for c, p in pts]
-    dc = [g(c, p, "decode_rps") for c, p in pts]
-    ax.bar(x - w / 2, pf, w, label="prefill_rps")
-    ax.bar(x + w / 2, dc, w, label="decode_rps")
-    ax.set_title("completed req/s per side  (1P1D: prefill==decode)")
+    pf = [g(c, p, "prefill_done_rps") for c, p in pts]
+    dc = [g(c, p, "decode_done_rps") for c, p in pts]
+    ax.bar(x - w / 2, pf, w, label="prefill 완료율 (req/s)")
+    ax.bar(x + w / 2, dc, w, label="decode 완료율 (req/s)")
+    ax.set_title("요청 완료율 = N ÷ (첫완료~끝완료 구간)  ·  prefill>decode면 decode가 병목")
     # B: concurrent batch (mean bar + max whisker)
     ax = axes[1]
     pfb = [g(c, p, "pf_bsz") for c, p in pts]
     dcb = [g(c, p, "dc_bsz") for c, p in pts]
     dcbmax = [g(c, p, "dc_bsz_max") for c, p in pts]
-    ax.bar(x - w / 2, pfb, w, label="prefill_batch (mean)")
-    ax.bar(x + w / 2, dcb, w, label="decode_batch (mean)")
+    ax.bar(x - w / 2, pfb, w, label="prefill 동시배치 (평균)")
+    ax.bar(x + w / 2, dcb, w, label="decode 동시배치 (평균)")
     whisker(ax, x + w / 2, dcb, dcbmax)
-    ax.set_title("concurrent batch  (bar=mean_active, whisker=decode max)")
+    ax.set_title("동시 배치수  (막대=활성평균, 수염=decode 최대)")
     # C: backlog (mean bar + max whisker)
     ax = axes[2]
     bl = [g(c, p, "backlog") for c, p in pts]
     blmax = [g(c, p, "backlog_max") for c, p in pts]
-    ax.bar(x, bl, w, label="backlog (mean)", color="tab:green")
+    ax.bar(x, bl, w, label="backlog (평균)", color="tab:green")
     whisker(ax, x, bl, blmax)
-    ax.set_title("backlog = prefill done, decode pending  (bar=mean, whisker=max)")
+    ax.set_title("backlog = prefill끝·decode대기 중인 요청  (막대=평균, 수염=최대)")
     for ax in axes:
         ax.set_xticks(x); ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=7)
         ax.legend(fontsize=7); ax.grid(axis="y", alpha=0.3)
