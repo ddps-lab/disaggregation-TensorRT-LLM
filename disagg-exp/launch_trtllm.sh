@@ -3,10 +3,11 @@
 # launch_trtllm.sh — TensorRT-LLM v1.2.1 PD-disaggregation 런처 (Qwen3-4B dense)
 # -----------------------------------------------------------------------------
 # 역할(ROLE): context | generation | proxy | all
-#   context     : prefill 워커 NUM_CTX개 기동 (백그라운드)
-#   generation  : decode  워커 NUM_GEN개 기동 (백그라운드)
+#   context     : prefill 워커 기동 (포그라운드=터미널 점유, 로그 실시간, Ctrl-C로 종료; 다중이면 마지막만 fg)
+#   generation  : decode  워커 기동 (포그라운드=터미널 점유, 로그 실시간, Ctrl-C로 종료; 다중이면 마지막만 fg)
 #   proxy       : orchestrator(=trtllm-serve disaggregated) 기동 (포그라운드, :8000)
 #   all         : 단일 노드 편의 — context+generation(bg) → health 대기 → proxy(fg)
+#   ※ 운영 권장: 터미널 1개 = 워커 1개 (context는 노드1 터미널, generation은 노드2 터미널, proxy는 노드1 새 터미널)
 #
 # 모든 (TP,PP,xPyD,placement)은 환경변수로 파라미터화 — 하드코딩 config 분기 없음.
 # 모든 플래그/키/포트는 v1.2.1 소스 대조 검증됨 (근거: disagg-exp/SETUP_LOG.md, CLAUDE.md).
@@ -103,8 +104,8 @@ build_urls() {  # role(ctx|gen)
   fi
 }
 
-# 워커 1개 기동 (백그라운드). role tp pp port gpus extra_yaml
-launch_worker() {
+# 워커 1개의 trtllm-serve 명령 (전경 실행 — &/리다이렉트는 호출자가 결정). role tp pp port gpus extra_yaml
+_worker_exec() {
   local role="$1" tp="$2" pp="$3" port="$4" gpus="$5" extra="$6"
   local role_flag=()
   if [[ "$USE_SERVER_ROLE" == "1" ]]; then
@@ -120,9 +121,23 @@ launch_worker() {
     --host 0.0.0.0 \
     --port "$port" \
     "${role_flag[@]+"${role_flag[@]}"}" \
-    --extra_llm_api_options "$extra" \
-    > "$LOG_DIR/trtllm_${LABEL}_${role}_p${port}_$(hostname).log" 2>&1 &
+    --extra_llm_api_options "$extra"
+}
+
+_worker_log() { echo "$LOG_DIR/trtllm_${LABEL}_${1}_p${2}_$(hostname).log"; }   # role port
+
+# 백그라운드 기동 (로그 파일로) → PID 반환. 'all' 모드 + 다중워커의 非마지막용.
+launch_worker() {  # role tp pp port gpus extra
+  local log; log="$(_worker_log "$1" "$4")"
+  _worker_exec "$@" > "$log" 2>&1 &
   echo "$!"   # PID
+}
+
+# 포그라운드 기동 (이 터미널 점유 + 로그 tee 동시기록). Ctrl-C로 종료. "터미널 1개 = 워커 1개" 경로.
+launch_worker_fg() {  # role tp pp port gpus extra
+  local log; log="$(_worker_log "$1" "$4")"
+  echo "[fg] $1 worker :$4 — 이 터미널을 점유합니다(로그 실시간). 끄려면 Ctrl-C." >&2
+  _worker_exec "$@" 2>&1 | tee "$log"
 }
 
 wait_health() {  # host port [timeout_s]
@@ -199,6 +214,28 @@ start_generation() {
   done
 }
 
+# 단일 역할(context|generation) 포그라운드 기동: 마지막 1개는 fg(터미널 점유), 나머지는 bg.
+# → "터미널 1개 = 워커 1개" 운영. 다중 워커면 非마지막은 bg + EXIT trap으로 Ctrl-C 시 함께 정리.
+run_role_fg() {  # role(context|generation)
+  local role="$1" n tp pp pbase gbase extra ranks
+  if [[ "$role" == "context" ]]; then
+    n="$NUM_CTX"; tp="$CTX_TP"; pp="$CTX_PP"; pbase="$CTX_PORT_BASE"; gbase="$CTX_GPU_BASE"; extra="$CTX_EXTRA"; ranks="$ctx_ranks"
+  else
+    n="$NUM_GEN"; tp="$GEN_TP"; pp="$GEN_PP"; pbase="$GEN_PORT_BASE"; gbase="$GEN_GPU_BASE"; extra="$GEN_EXTRA"; ranks="$gen_ranks"
+  fi
+  (( n > 1 )) && trap 'echo "[trap] killing bg workers ${PIDS[*]:-}" >&2; [[ ${#PIDS[@]} -gt 0 ]] && kill "${PIDS[@]}" 2>/dev/null || true' EXIT
+  local i port gpus last=$(( n - 1 ))
+  for (( i=0; i<n; i++ )); do
+    port=$(( pbase + i )); gpus="$(gpu_slice "$gbase" "$i" "$ranks")"
+    if (( i < last )); then
+      PIDS+=("$(launch_worker "$role" "$tp" "$pp" "$port" "$gpus" "$extra")")   # bg
+    else
+      (( n > 1 )) && echo "[pids bg] ${PIDS[*]:-}" >&2
+      launch_worker_fg "$role" "$tp" "$pp" "$port" "$gpus" "$extra"             # fg(블록)
+    fi
+  done
+}
+
 start_proxy() {
   local cfg="$LOG_DIR/disagg_${LABEL}.yaml"
   write_disagg_yaml "$cfg"
@@ -213,8 +250,8 @@ start_proxy() {
 }
 
 case "$ROLE" in
-  context)    start_context;    echo "[pids] ${PIDS[*]:-}"; wait ;;
-  generation) start_generation; echo "[pids] ${PIDS[*]:-}"; wait ;;
+  context)    run_role_fg context ;;
+  generation) run_role_fg generation ;;
   proxy)      start_proxy ;;
   all)
     # 빈 배열 확장 가드(bash<4.4 이식성): start_context 실패로 PIDS가 비어도 안전

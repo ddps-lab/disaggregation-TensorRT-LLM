@@ -41,7 +41,24 @@ from pathlib import Path
 
 import aiohttp
 
-import prom_scrape   # per-side(prefill/decode) RPS 스크레이퍼 — 공식이 못 주는 유일한 커스텀 조각
+import prom_scrape       # per-side(prefill/decode) RPS 스크레이퍼 — 공식이 못 주는 커스텀 조각
+import metrics_sampler   # per-side 배치수·KV사용 샘플러 (워커 /metrics 폴링)
+
+
+# ── 워커 /metrics 엔드포인트 (per-side 배치수·KV 샘플러용) ─────────────────────
+#   launch_trtllm.sh와 동일하게 CTX_URLS/GEN_URLS env에서 워커 주소를 읽음(콤마구분 다중 가능).
+#   미설정 시 localhost 기본(intra). ⚠️ inter-node면 sweep 명령에도 CTX_URLS/GEN_URLS를 줘야
+#   원격 gen 워커 /metrics에 닿음 (orchestrator :8000엔 iteration stats가 없음).
+def _worker_metrics_endpoints():
+    import os as _os
+    eps = []
+    for u in [x.strip() for x in (_os.environ.get("CTX_URLS") or "localhost:8001").split(",") if x.strip()]:
+        eps.append(("prefill", f"http://{u}"))
+    for u in [x.strip() for x in (_os.environ.get("GEN_URLS") or "localhost:8011").split(",") if x.strip()]:
+        eps.append(("decode", f"http://{u}"))
+    return eps
+
+WORKER_METRICS_EPS = _worker_metrics_endpoints()
 
 # ── grid (실험 조건표) ────────────────────────────────────────────────────────
 # 환경변수로 오버라이드 가능하며, (prefill,decode)×rate 교차곱이 전체 Grid를 구성합니다.
@@ -168,6 +185,7 @@ async def run_point(
     result_filename: str,
     out_dir: Path,
     prom_out: Path | None = None,
+    batch_out: Path | None = None,
 ) -> bool:
     """공식 benchmark_serving로 warmup→measured 실행. measured 결과 = out_dir/result_filename.
     prom_out 지정 시 measured 윈도우 전/후로 per-side 카운터 스냅샷(warmup 제외 = 변인통제).
@@ -180,14 +198,22 @@ async def run_point(
                                    WARMUP_N, None, None, streaming=False)
     await run_bench(warmup_args)
 
-    # ── 2단계: measured (공식 측정) — per-side 카운터로 윈도우 bracket ──
+    # ── 2단계: measured (공식 측정) — per-side 카운터로 윈도우 bracket + 배치수 샘플링 ──
     before_prom = after_prom = None   # async with 밖에서 읽으므로 미리 None
+    batch_stats = None
     async with aiohttp.ClientSession() as session:
         if prom_out is not None:
             before_prom = await prom_scrape.snapshot(session, base_url)
+        # per-side 배치수·KV 샘플러: measured 동안만 워커 /metrics 폴링 (warmup 제외=변인통제)
+        sampler = None
+        if batch_out is not None and WORKER_METRICS_EPS:
+            sampler = metrics_sampler.BatchSampler(session, WORKER_METRICS_EPS, interval=1.0)
+            sampler.start()
         measured_args = build_bench_args(base_url, prefill_len, decode_len, rate,
                                          MEASURED_N, out_dir, result_filename, streaming=True)
         rc = await run_bench(measured_args)
+        if sampler is not None:
+            batch_stats = await sampler.stop()   # 폴링 종료 + per-side 평균/최대 집계
         if prom_out is not None:
             after_prom = await prom_scrape.snapshot(session, base_url)
 
@@ -195,7 +221,10 @@ async def run_point(
     if prom_out is not None and before_prom is not None and after_prom is not None:
         window_s = after_prom.get("ts", 0) - before_prom.get("ts", 0)
         with open(prom_out, "w") as f:
-            json.dump({"before": before_prom, "after": after_prom, "window_s": window_s}, f)
+            json.dump({"before": before_prom, "after": after_prom, "window_s": window_s}, f, indent=2)
+    if batch_out is not None and batch_stats:
+        with open(batch_out, "w") as f:
+            json.dump(batch_stats, f, indent=2)
 
     # 성공판정: benchmark_serving 종료코드 0 + result.json 생성
     result_path = out_dir / result_filename
@@ -348,7 +377,7 @@ async def fetch_perf_metrics(base_url: str, out_path: Path) -> None:
         return
     try:
         with open(out_path, "w") as f:
-            json.dump(data, f)
+            json.dump(data, f, indent=2)   # 사람이 IDE에서 보기 쉽게 들여쓰기
         recs = data if isinstance(data, list) else []
 
         def _has_kv(e: dict) -> bool:
@@ -441,7 +470,8 @@ async def main(args: argparse.Namespace) -> None:
         try:
             ok = await run_point(base_url, config, prefill_len, decode_len, rate,
                                  result_filename=bench_file, out_dir=out_dir,
-                                 prom_out=out_dir / f"prom_{point_id}.json")
+                                 prom_out=out_dir / f"prom_{point_id}.json",
+                                 batch_out=out_dir / f"batch_{point_id}.json")
         except Exception as exc:
             print(f"  ERROR: {exc}", flush=True)
             marker_failed.touch()

@@ -27,25 +27,11 @@ try:
 except ImportError:
     HAS_MPLOT = False
 
-# AWS On-Demand $/hr — us-east-1 기준(2025). ⚠️ 리전·변동에 따라 반드시 재확인.
-#   확인됨: g5.12xlarge=5.672, g6.xlarge=0.8048, g6e.xlarge=1.861
-#          (출처 aws.amazon.com/ec2/pricing/on-demand)
-#   근사(재확인 필요): g5.xlarge≈1.006, g6.12xlarge≈4.6016, g6e.12xlarge≈10.49
-_INSTANCE_HR = {
-    "g5.xlarge": 1.006,  "g5.12xlarge": 5.672,
-    "g6.xlarge": 0.8048, "g6.12xlarge": 4.6016,
-    "g6e.xlarge": 1.861, "g6e.12xlarge": 10.49,
-}
-# config 라벨별 총 $/hr = 그 config가 점유한 인스턴스 합.
-# ⚠️ 키는 sweep.py --config 라벨과 글자단위 일치해야 함(불일치 시 $/Mtok=NaN).
-# ⚠️ 아래는 placeholder — 최종 인스턴스/노드수 확정 후 조정.
-#    inter-node 1P1D면 2개 인스턴스 합으로, 1P3D면 점유 인스턴스 수만큼 합산.
-COST_PER_HR = {
-    "T1": _INSTANCE_HR["g6.xlarge"] * 2,   # inter 1P1D 베이스라인 (prefill + decode 노드)
-    "T2": _INSTANCE_HR["g6.12xlarge"],     # 1P3D — 실제 점유로 조정
-    "T3": _INSTANCE_HR["g6.12xlarge"],     # 비대칭 TP/PP
-    "T4": _INSTANCE_HR["g6.12xlarge"],     # intra 반복
-}
+# 비용($/Mtok)은 analyze에서 계산하지 않는다 (사용자 결정 2026-06-24).
+#   이유: $/Mtok = (인스턴스수 × $/hr) / output_throughput — throughput만 있으면 언제든
+#   재계산되는 산수이고, 단가를 코드에 박으면 region/spot/시점에 따라 stale해짐.
+#   → analyze는 측정치(throughput/latency/per-side)만 출력. 비용은 writeup에서 그 시점
+#     단가를 측정 throughput에 곱해 외부 계산한다.
 
 
 def _p(arr: list[float], pct: float) -> float:
@@ -206,22 +192,35 @@ def load_prom(config_dir: Path, point_id: str, mean_pt: float | None, mean_ct: f
     return out
 
 
-def dollar_per_m_tokens(stats: dict, config: str) -> float:
-    """$/M output tokens using official output_throughput and on-demand price."""
-    thr = stats.get("out_tok_s")
-    if not thr or thr != thr:
-        return float("nan")
-    cost_hr = COST_PER_HR.get(config, float("nan"))
-    m_tok_hr = thr * 3600 / 1e6   # tokens/s → M tokens/hr
-    return cost_hr / m_tok_hr if m_tok_hr else float("nan")
+def load_batch(config_dir: Path, point_id: str) -> dict:
+    """batch_<point>.json (워커 /metrics 샘플) → per-side 배치수·KV사용 (mean). 없으면 {}.
+    pf_bsz=prefill 평균 배치(numContextRequests), dc_bsz=decode 평균 배치(numGenRequests),
+    dc_kv_pct=decode KV풀 사용률(usedNumBlocks/maxNumBlocks)."""
+    p = config_dir / f"batch_{point_id}.json"
+    if not p.exists():
+        return {}
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except Exception:
+        return {}
+    out: dict = {}
+    if d.get("prefill_batch_mean") is not None:
+        out["pf_bsz"] = d["prefill_batch_mean"]
+    if d.get("decode_batch_mean") is not None:
+        out["dc_bsz"] = d["decode_batch_mean"]
+    if d.get("decode_kv_used_frac_mean") is not None:
+        out["dc_kv_pct"] = d["decode_kv_used_frac_mean"] * 100
+    return out
 
 
 def print_table(all_stats: dict[str, dict[str, dict]]) -> None:
     header = (
         f"{'config':<8} {'point':<28} {'n_ok':>6} {'fail%':>6}"
         f" {'ttft_p50':>9} {'ttft_p99':>9} {'tpot_p50':>9} {'tpot_p99':>9}"
-        f" {'itl_p99':>8} {'e2el_p99':>9} {'out_tok/s':>10} {'$/Mtok':>8}"
+        f" {'itl_p99':>8} {'e2el_p99':>9} {'out_tok/s':>10}"
         f" {'kv_p50':>8} {'kv_p99':>8} {'pf_rps':>7} {'dc_rps':>7} {'pf_tps':>8} {'dc_tps':>8}"
+        f" {'pf_bsz':>7} {'dc_bsz':>7} {'dc_kv%':>7}"
     )
     print(header)
     print("-" * len(header))
@@ -232,7 +231,6 @@ def print_table(all_stats: dict[str, dict[str, dict]]) -> None:
             if s.get("n_ok", 0) == 0:
                 print(f"{config:<8} {point_id:<28} {'NO DATA':>6}")
                 continue
-            dpm = dollar_per_m_tokens(s, config)
             fail_pct = s.get("fail_rate")
             fail_s = f"{fail_pct*100:>5.1f}%" if isinstance(fail_pct, (int, float)) and fail_pct == fail_pct else f"{'n/a':>6}"
             print(
@@ -240,15 +238,16 @@ def print_table(all_stats: dict[str, dict[str, dict]]) -> None:
                 f" {_fmt(s.get('ttft_p50_ms'),9)} {_fmt(s.get('ttft_p99_ms'),9)}"
                 f" {_fmt(s.get('tpot_p50_ms'),9)} {_fmt(s.get('tpot_p99_ms'),9)}"
                 f" {_fmt(s.get('itl_p99_ms'),8)} {_fmt(s.get('e2el_p99_ms'),9)}"
-                f" {_fmt(s.get('out_tok_s'),10)} {_fmt(dpm,8,3)}"
+                f" {_fmt(s.get('out_tok_s'),10)}"
                 f" {_fmt(s.get('kv_transfer_p50_ms'),8,2)} {_fmt(s.get('kv_transfer_p99_ms'),8,2)}"
                 f" {_fmt(s.get('prefill_rps'),7,2)} {_fmt(s.get('decode_rps'),7,2)}"
                 f" {_fmt(s.get('prefill_tps'),8,0)} {_fmt(s.get('decode_tps'),8,0)}"
+                f" {_fmt(s.get('pf_bsz'),7,2)} {_fmt(s.get('dc_bsz'),7,2)} {_fmt(s.get('dc_kv_pct'),7,1)}"
             )
 
 
 def plot_comparison(all_stats: dict[str, dict[str, dict]], out_dir: Path) -> None:
-    """One plot per (prefill_len, decode_len) pair: TTFT/TPOT/$ vs rate for all configs."""
+    """One plot per (prefill_len, decode_len) pair: TTFT/TPOT/throughput vs rate for all configs."""
     if not HAS_MPLOT:
         print("matplotlib not available, skipping plots")
         return
@@ -263,7 +262,7 @@ def plot_comparison(all_stats: dict[str, dict[str, dict]], out_dir: Path) -> Non
             by_pd[(pl, dl)].setdefault(config, []).append((r, s))
 
     for (pl, dl), config_data in by_pd.items():
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        fig, axes = plt.subplots(1, 4, figsize=(20, 4))
         fig.suptitle(f"prefill={pl} decode={dl}")
 
         for config, rate_stats in sorted(config_data.items()):
@@ -272,16 +271,21 @@ def plot_comparison(all_stats: dict[str, dict[str, dict]], out_dir: Path) -> Non
             ttft50 = [_num(x[1].get("ttft_p50_ms")) for x in rate_stats]
             ttft99 = [_num(x[1].get("ttft_p99_ms")) for x in rate_stats]
             tpot50 = [_num(x[1].get("tpot_p50_ms")) for x in rate_stats]
-            dpm    = [_num(dollar_per_m_tokens(x[1], config)) for x in rate_stats]
+            thr    = [_num(x[1].get("out_tok_s")) for x in rate_stats]
+            pf_bsz = [_num(x[1].get("pf_bsz")) for x in rate_stats]
+            dc_bsz = [_num(x[1].get("dc_bsz")) for x in rate_stats]
 
             axes[0].plot(rates, ttft50, marker="o", label=f"{config} p50")
             axes[0].plot(rates, ttft99, marker="x", linestyle="--", label=f"{config} p99")
             axes[1].plot(rates, tpot50, marker="o", label=config)
-            axes[2].plot(rates, dpm, marker="o", label=config)
+            axes[2].plot(rates, thr, marker="o", label=config)
+            axes[3].plot(rates, pf_bsz, marker="o", label=f"{config} prefill")
+            axes[3].plot(rates, dc_bsz, marker="s", linestyle="--", label=f"{config} decode")
 
         axes[0].set_title("TTFT (ms)");        axes[0].set_xlabel("rate (req/s)"); axes[0].legend(fontsize=7)
         axes[1].set_title("TPOT p50 (ms/tok)"); axes[1].set_xlabel("rate (req/s)"); axes[1].legend(fontsize=7)
-        axes[2].set_title("$/M tokens (OD)");   axes[2].set_xlabel("rate (req/s)"); axes[2].legend(fontsize=7)
+        axes[2].set_title("output throughput (tok/s)"); axes[2].set_xlabel("rate (req/s)"); axes[2].legend(fontsize=7)
+        axes[3].set_title("batch (in-flight req)"); axes[3].set_xlabel("rate (req/s)"); axes[3].legend(fontsize=7)
 
         fig.tight_layout()
         fname = out_dir / f"plot_p{pl}_d{dl}.png"
@@ -311,6 +315,7 @@ def main(args: argparse.Namespace) -> None:
             s = dict(b)
             s.update(load_perf(config_dir, point_id))                       # KV전송시간 (있으면)
             s.update(load_prom(config_dir, point_id, mean_pt, mean_ct))     # per-side RPS/TPS (있으면)
+            s.update(load_batch(config_dir, point_id))                      # per-side 배치수·KV사용 (있으면)
             all_stats[config][point_id] = s
 
     if not all_stats:

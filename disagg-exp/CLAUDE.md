@@ -12,7 +12,8 @@
 - **질문**: PD 분리에서 prefill·decode의 병렬화(TP·PP)를 **대칭/비대칭**으로, 토폴로지를 **xPyD(1P1D→1P3D→D확장)**로 바꿀 때 비용대비 성능이 어떻게 변하나.
 - **독립변수**: (P의 TP,PP) × (D의 TP,PP) × xPyD(P·D 인스턴스 수) × placement(inter/intra-node).
 - **통제변수**: 아래 "변인통제" 표 전부 고정.
-- **메트릭**: TTFT p50/p99, TPOT=(e2e−ttft)/(completion−1) p50/p99, throughput 2종(service/arrival window), achieved_rate(saturation), $/Mtok. (정의·계산은 기존 `analyze.py` 그대로 계승)
+- **메트릭**: TTFT p50/p99, TPOT=(e2e−ttft)/(completion−1) p50/p99, throughput 2종(service/arrival window), achieved_rate(saturation), **per-side prefill/decode RPS·TPS**. (정의·계산 `analyze.py` 계승)
+  - **비용은 analyze에서 빼고**(2026-06-24 결정) writeup에서 외부 계산: `$/Mtok = (인스턴스수 × $/hr) / output_throughput`. throughput은 측정·기록되므로 그 시점 단가로 언제든 재계산(코드에 단가 박으면 region/spot/시점에 stale). analyze는 측정치만 출력.
 - **DP는 축이 아님**: dense Qwen3-4B에서 독립 DP 모델-병렬 축 없음. "DP"=attention-DP(MoE/MLA 전용) 또는 xPyD의 D 복제수. 실제 모델-병렬 축 = **(TP, PP)** 둘뿐.
 
 ## 확정 스택 + 핀 (Pin — research-rigor #10)
