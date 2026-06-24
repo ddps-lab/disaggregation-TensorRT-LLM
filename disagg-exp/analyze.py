@@ -152,13 +152,15 @@ def _agg3(vals: list) -> dict:
 #   prefill_queue   = ctx first_scheduled − ctx arrival      (prefill 큐 대기)
 #   kv_transfer     = gen transfer_end − transfer_start      (inter-node KV전송, = "버퍼 대기")
 #   handoff         = gen arrival − ctx 첫토큰               (orchestrator relay)
-#   decode_queue    = gen first_scheduled − gen arrival      (decode 큐 대기 = 보통 지배적!)
+#   transfer_pool_wait = gen transfer_start − gen arrival   (순수 풀 대기, 전송 시작 전까지 — 전송시간과 안 겹침)
+#   decode_queue    = gen first_scheduled − gen arrival      (총 gen-측 큐 = transfer_pool_wait + kv_transfer + 작은꼬리)
 #   decode          = gen 마지막토큰 − gen 첫토큰            (순수 decode, 첫토큰 이후)
-#   ttft_recon      = disagg 첫토큰 − disagg 도착            (재구성 TTFT; 클라 ttft와 교차검증)
-#   e2e             = gen 마지막토큰 − disagg 도착           (요청 전체)
-# ⚠️ 단계 합 ≈ e2e (정확한 분할 아님 — 일부 overlap/생략 segment 있음, glossary 참고).
+#   ttft_recon      = disagg 첫토큰 − disagg 도착            (재구성 TTFT = 위 도착~첫토큰 단계들의 합. 별개 atom 아님!)
+#   e2e             = gen 마지막토큰 − disagg 도착           (요청 전체 = 모든 atom의 합)
+# ⚠️ 겹침구조(전수검증): kv_transfer ⊂ decode_queue, ttft_recon ⊃ {prefill_queue, transfer_pool_wait, kv_transfer}.
+#   비겹침 atom(합=e2e): prefill_queue + prefill_compute + handoff + transfer_pool_wait + kv_transfer + decode.
 _PERF_STAGES = ("prefill_compute", "prefill_queue", "kv_transfer", "handoff",
-                "decode_queue", "decode", "ttft_recon", "e2e")
+                "transfer_pool_wait", "decode_queue", "decode", "ttft_recon", "e2e")
 
 
 def load_perf_breakdown(config_dir: Path, point_id: str) -> dict:
@@ -201,10 +203,12 @@ def load_perf_breakdown(config_dir: Path, point_id: str) -> dict:
             cols["prefill_queue"].append(cfs - ca)
         if isinstance(te, (int, float)) and isinstance(ts, (int, float)):
             cols["kv_transfer"].append(te - ts)
+        if isinstance(ts, (int, float)) and isinstance(ga, (int, float)):
+            cols["transfer_pool_wait"].append(ts - ga)   # 순수 풀 대기 = 전송 '시작' 전까지. transfer_pool_wait + kv_transfer + (작은꼬리) = decode_queue. → 전송시간과 안 겹침
         if isinstance(ga, (int, float)) and isinstance(cft, (int, float)):
             cols["handoff"].append(ga - cft)
         if isinstance(gfs, (int, float)) and isinstance(ga, (int, float)):
-            cols["decode_queue"].append(gfs - ga)
+            cols["decode_queue"].append(gfs - ga)         # 총 gen-측 큐(=transfer_pool_wait + kv_transfer + 작은꼬리); 표/참고용
         if isinstance(dft, (int, float)) and isinstance(da, (int, float)):
             cols["ttft_recon"].append(dft - da)
         if isinstance(da, (int, float)):
@@ -345,16 +349,16 @@ _TABLE_GROUPS = [
         ("decode_time_median_s", "decode_stage_s", 0, 3),
         ("e2e_time_median_s", "e2e_stage_s", 0, 3),
     ]),
-    ("①b 단계분해 상세 (perf_metrics, 초, p50) — TTFT는 보통 decode_queue(=decode 슬롯 대기)가 지배. 단계합≈e2e(정확분할 아님)", [
-        ("prefill_compute_p50_s", "prefill_compute_p50_s", 0, 3),
+    ("①b 비겹침 atom 분해 (perf_metrics, 초, p50) — 합=e2e(전수검증 오차 0.01%). transfer_pool_wait+kv_transfer=총 gen큐(decode_queue). TTFT/E2EL은 atom 합(별개 아님)", [
         ("prefill_queue_p50_s", "prefill_queue_p50_s", 0, 3),
-        ("kv_transfer_p50_s", "kv_transfer_p50_s", 0, 3),
+        ("prefill_compute_p50_s", "prefill_compute_p50_s", 0, 3),
         ("handoff_p50_s", "handoff_p50_s", 0, 3),
-        ("decode_queue_p50_s", "decode_queue_p50_s", 0, 3),
-        ("decode_queue_mean_s", "decode_queue_mean_s", 0, 3),
-        ("decode_queue_p99_s", "decode_queue_p99_s", 0, 3),
+        ("transfer_pool_wait_p50_s", "transfer_pool_wait_p50_s", 0, 3),
+        ("kv_transfer_p50_s", "kv_transfer_p50_s", 0, 3),
         ("decode_p50_s", "decode_p50_s", 0, 3),
-        ("ttft_recon_p50_s", "ttft_recon_p50_s", 0, 3),
+        ("decode_queue_total_p50_s", "decode_queue_p50_s", 0, 3),
+        ("decode_queue_total_p99_s", "decode_queue_p99_s", 0, 3),
+        ("ttft_recon_sum_p50_s", "ttft_recon_p50_s", 0, 3),
     ]),
     ("② 공식 지연 (benchmark_serving, 클라이언트 측정, 초) — TTFT=첫토큰까지·TPOT=토큰당·E2E=요청끝까지", [
         ("requests_ok", "n_ok", 0, 0), ("fail_pct", "fail_pct", 0, 1),
@@ -680,18 +684,21 @@ def plot_latency_decomp(all_stats: dict, out_dir: Path) -> None:
         return out
 
     # request lifecycle order (user spec): queuing delay → TTFT → KV-transfer queuing → transfer time → TPOT → E2EL
+    # atoms = non-overlapping (Queuing delay, transfer pool wait, transfer time, TPOT·decode).
+    # TTFT & E2EL = SUMMARY totals (contain the atoms) — labeled [sum] so they aren't read as separate slices.
     panels = [
-        ("Queuing delay (s)", series("prefill_queue")),
-        ("TTFT (s)", series("ttft_recon")),
-        ("KV-cache transfer queuing delay (s)", series("decode_queue")),
-        ("KV-cache transfer time (s)", series("kv_transfer")),
-        ("TPOT (s)", tpot_series()),
-        ("End-to-end latency, E2EL (s)", series("e2el")),
+        ("Queuing delay (s)  [atom]", series("prefill_queue")),
+        ("TTFT (s)  [sum: arrival→first token]", series("ttft_recon")),
+        ("KV-cache transfer pool wait (s)  [atom]", series("transfer_pool_wait")),
+        ("KV-cache transfer time (s)  [atom]", series("kv_transfer")),
+        ("TPOT (s)  [atom: decode/(OSL-1)]", tpot_series()),
+        ("End-to-end latency, E2EL (s)  [sum: whole request]", series("e2el")),
     ]
     x = np.arange(len(labels))
     w = 0.27
     fig, axes = plt.subplots(2, 3, figsize=(20, 10))
-    fig.suptitle("Latency decomposition per point — mean / p50 / p99  (perf_metrics, warmup-filtered)")
+    fig.suptitle("Latency decomposition per point — mean / p50 / p99  (perf_metrics, warmup-filtered).  "
+                 "[atom] = non-overlapping;  [sum] TTFT⊃(Queuing+transfer pool wait+transfer time),  E2EL⊃all")
     for ax, (title, data) in zip(axes.flat, panels):
         m = [_num(d.get("mean")) for d in data]
         p5 = [_num(d.get("p50")) for d in data]
