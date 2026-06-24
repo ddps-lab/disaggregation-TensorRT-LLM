@@ -99,6 +99,14 @@ class BatchSampler:
         rows = self._samples.get(side) or []
         return rows[-1]["batch"] if rows else None
 
+    def _last_kv_frac(self, side: str):
+        """그 측 KV풀 사용률(usedNumBlocks/maxNumBlocks, 0~1). 최근 유효 샘플. → 시계열 패널용."""
+        for r in reversed(self._samples.get(side) or []):
+            u, m = r.get("used"), r.get("maxb")
+            if isinstance(u, (int, float)) and isinstance(m, (int, float)) and m:
+                return u / m
+        return None
+
     @staticmethod
     def _rel(val, base):
         """누적 카운터를 이 실험 시작(baseline) 기준 상대값으로. = 이 실험에서 완료한 수."""
@@ -139,6 +147,7 @@ class BatchSampler:
                 "backlog": (self._backlog[-1] if self._backlog else None),       # prefill끝·decode대기 수(buffer)
                 "prefill_batch": self._last_batch("prefill"),                    # 그 순간 동시 배치수
                 "decode_batch": self._last_batch("decode"),
+                "decode_kv_frac": self._last_kv_frac("decode"),                  # decode KV풀 사용률 0~1(시계열 패널②)
             })
             if self._live and self._tick % self._live_every == 0:
                 self._print_live()

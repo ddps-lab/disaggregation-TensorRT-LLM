@@ -24,14 +24,7 @@ try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    # 패널 제목에 한글(요청큐/전송큐 등) 쓰므로 한글 폰트 지정(없으면 조용히 기본).
-    import matplotlib.font_manager as _fm
-    _avail = {f.name for f in _fm.fontManager.ttflist}
-    for _kf in ("AppleGothic", "Apple SD Gothic Neo", "NanumGothic", "Noto Sans CJK KR"):
-        if _kf in _avail:
-            plt.rcParams["font.family"] = _kf
-            break
-    plt.rcParams["axes.unicode_minus"] = False   # 한글폰트서 마이너스 깨짐 방지
+    # plot 라벨은 전부 영어(논문 표준 워딩) → 기본 폰트 사용. (REPORT/표는 한글 markdown, 폰트 무관)
     HAS_MPLOT = True
 except ImportError:
     HAS_MPLOT = False
@@ -535,12 +528,10 @@ def write_report(config: str, config_dir: Path, stats_one: dict) -> None:
 
 
 def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
-    """[grid 포인트 1개의 시간순 동역학] timeseries_<point>.jsonl(1Hz per-tick)를 읽어
-    3패널 시계열을 그 config 폴더에 저장:
-      ① 동시 배치수(prefill/decode)가 시간에 따라 어떻게 변하나
-      ② backlog = prefill 끝났는데 decode 대기 중인 요청수(프리필 큐에 쌓인 양)
-      ③ 이 실험 완료수(0부터, 누적 아님) — 총 처리가 어떻게 진행되나
-    (배치수는 enable_iter_perf_stats:true여야 채워짐. null이면 그 패널만 'n/a' 표시.)"""
+    """[포인트 1개의 시간순 동역학] timeseries_<point>.jsonl(per-tick)를 읽어 5패널 시계열 저장(라벨 영어):
+      ① 현재 배치수(prefill/decode)  ② decode KV캐시 사용률(%)  ③ 요청큐 깊이(도착·prefill 전)
+      ④ KV전송 풀 backlog(prefill끝·decode 대기)  ⑤ prefill·decode 누적 완료수(같은 축, 기울기=throughput)
+    ②③는 신규 trace 키(decode_kv_frac / prefill_queue) 필요 — 구 trace엔 'needs re-run' 표시."""
     if not HAS_MPLOT:
         return
     fp = _raw_dir(config_dir) / f"{F_LIVE}_{point_id}.jsonl"
@@ -566,11 +557,24 @@ def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
                 ys.append(v)
         return xs, ys
 
-    # 라벨은 영어로 (컨테이너 matplotlib에 한글 폰트 없어 □ 깨짐 + 논문용 적합).
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4))
-    fig.suptitle(f"{config}  {point_id}  (time-series, t = s since measure start)")
+    def xyk(num_key, den_key):  # 비율 시계열 → % (num/den, 둘 다 있을 때만)
+        xs, ys = [], []
+        for r in rows:
+            n, d = r.get(num_key), r.get(den_key)
+            if isinstance(n, (int, float)) and isinstance(d, (int, float)) and d:
+                xs.append(r.get("t")); ys.append(100.0 * n / d)
+        return xs, ys
 
-    # ① concurrent batch
+    def note_rerun(ax):  # 이 trace에 없는 신규 지표 — 재런 필요 표시
+        ax.text(0.5, 0.5, "needs re-run\n(not in this trace)", ha="center", va="center",
+                transform=ax.transAxes, fontsize=10, color="gray")
+
+    # 라벨 전부 영어(논문 표준). 5패널: 배치 / KV사용률 / 요청큐깊이 / 전송풀 backlog / 누적완료
+    fig, axes = plt.subplots(2, 3, figsize=(19, 8))
+    fig.suptitle(f"{config}  {point_id}  (time-series, t = s since measure start)")
+    axes = axes.flatten()
+
+    # ① concurrent batch (현재 배치)
     ax = axes[0]
     pf_x, pf_y = xy("prefill_batch", "pf_bsz")
     dc_x, dc_y = xy("decode_batch", "dc_bsz")
@@ -578,39 +582,58 @@ def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
         ax.plot(pf_x, pf_y, marker=".", label="prefill batch")
     if dc_x:
         ax.plot(dc_x, dc_y, marker=".", label="decode batch")
-    if not pf_x and not dc_x:
-        ax.text(0.5, 0.5, "batch n/a\n(set enable_iter_perf_stats, re-measure)",
-                ha="center", va="center", transform=ax.transAxes, fontsize=9)
+    if pf_x or dc_x:
+        ax.legend(fontsize=8)
     else:
-        ax.legend(fontsize=8)
-    ax.set_title("concurrent batch (req)"); ax.set_xlabel("t (s)"); ax.set_ylabel("batch")
+        note_rerun(ax)
+    ax.set_title("Concurrent batch (requests)"); ax.set_xlabel("t (s)"); ax.set_ylabel("requests")
 
-    # ② queues over time: prefill-side queue (대기) + backlog (prefill done, decode pending)
+    # ② KV-cache utilization, decode (현재 KV캐시 사용률)
     ax = axes[1]
-    qx, qy = xy("prefill_queue")                 # ctx_total - ctx_completed (재수집한 run만 존재)
-    bx, by = xy("backlog")
-    if qx:
-        ax.plot(qx, qy, marker=".", color="tab:red", label="prefill_queue (arrived, not prefilled)")
-    if bx:
-        ax.plot(bx, by, marker=".", color="tab:green", label="backlog (prefilled, not decoded)")
-    if qx or bx:
-        ax.legend(fontsize=8)
-    if not qx:
-        ax.text(0.5, 0.02, "prefill_queue: re-run for this (not in old trace)",
-                ha="center", va="bottom", transform=ax.transAxes, fontsize=7, color="gray")
-    ax.set_title("queues over time (waiting requests)"); ax.set_xlabel("t (s)"); ax.set_ylabel("req")
+    kx, ky = xy("decode_kv_frac")
+    if kx:
+        ky = [v * 100.0 for v in ky]                       # frac 0~1 → %
+    else:
+        kx, ky = xyk("decode_kv_used", "decode_kv_max")    # used/max → %
+    if kx:
+        ax.plot(kx, ky, marker=".", color="tab:purple"); ax.set_ylim(0, 105)
+    else:
+        note_rerun(ax)
+    ax.set_title("KV-cache utilization, decode (%)"); ax.set_xlabel("t (s)"); ax.set_ylabel("%")
 
-    # ③ cumulative completions
+    # ③ request-queue depth (요청큐 대기 수: 도착했으나 prefill 전)
     ax = axes[2]
+    qx, qy = xy("prefill_queue")
+    if qx:
+        ax.plot(qx, qy, marker=".", color="tab:red")
+    else:
+        note_rerun(ax)
+    ax.set_title("Request-queue depth (waiting to prefill)"); ax.set_xlabel("t (s)"); ax.set_ylabel("requests")
+
+    # ④ transfer-pool backlog (KV전송 풀 대기 수: prefill끝·decode 대기)
+    ax = axes[3]
+    bx, by = xy("backlog")
+    if bx:
+        ax.plot(bx, by, marker=".", color="tab:green")
+    else:
+        note_rerun(ax)
+    ax.set_title("KV transfer-pool backlog (prefilled, awaiting decode)"); ax.set_xlabel("t (s)"); ax.set_ylabel("requests")
+
+    # ⑤ cumulative completions (prefill·decode 끝낸 누적 — 같은 그래프)
+    ax = axes[4]
     cx, cy = xy("prefill_done", "ctx_done")
     gx, gy = xy("decode_done", "gen_done")
     if cx:
-        ax.plot(cx, cy, marker=".", label="prefill_done (this run)")
+        ax.plot(cx, cy, marker=".", label="prefill done")
     if gx:
-        ax.plot(gx, gy, marker=".", linestyle="--", label="decode_done (this run)")
+        ax.plot(gx, gy, marker=".", linestyle="--", label="decode done")
     if cx or gx:
         ax.legend(fontsize=8)
-    ax.set_title("completions this run (slope = rps)"); ax.set_xlabel("t (s)"); ax.set_ylabel("requests")
+    else:
+        note_rerun(ax)
+    ax.set_title("Cumulative completions (slope = throughput)"); ax.set_xlabel("t (s)"); ax.set_ylabel("requests")
+
+    axes[5].axis("off")   # 6번째 칸 비움 (5패널)
 
     fig.tight_layout()
     plots = config_dir / "plots"
@@ -622,10 +645,11 @@ def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
 
 
 def plot_latency_decomp(all_stats: dict, out_dir: Path) -> None:
-    """[compare #1] 요청 한 개의 시간이 어디서 대기/소비되나, 포인트별 mean/p50/p99 묶음막대.
-    요청 일생 순: ①요청큐 대기(prefill 슬롯) → ②온전한 prefill → ③KV캐시 전송큐 대기(버퍼·보통 최대)
-    → ④보내는 시간(KV 노드간 전송) → ⑤온전한 decode, 그리고 요약 ⑥TTFT ⑦TPOT ⑧e2e(공식 client E2EL).
-    e2e는 공식 E2EL 1개만(재구성과 0.3% 일치 검증 끝). (perf_metrics, warmup 제외.)"""
+    """[compare #1] 요청 지연 분해, 포인트별 mean/p50/p99 묶음막대. 라벨은 영어(논문 표준 워딩).
+    순서(사용자 스펙): Queuing delay → TTFT → KV-cache transfer queuing delay → KV-cache transfer time
+    → TPOT → E2EL. TTFT/TPOT에 prefill/decode 원시단계 섞지 않음. (perf_metrics, warmup 제외.)
+      매핑: Queuing delay=prefill_queue, transfer queuing delay=decode_queue(전송풀 대기),
+            transfer time=kv_transfer, E2EL=공식 client E2EL."""
     if not HAS_MPLOT:
         return
     pts = [(c, p) for c in sorted(all_stats) for p in sorted(all_stats[c])]
@@ -648,21 +672,19 @@ def plot_latency_decomp(all_stats: dict, out_dir: Path) -> None:
                         for k in ("mean", "p50", "p99")})
         return out
 
-    # 요청 일생 순서: 도착 → ①요청큐 → ②prefill → ③KV전송큐(버퍼) → ④보내는시간 → ⑤decode, 그리고 요약 ⑥⑦⑧
+    # request lifecycle order (user spec): queuing delay → TTFT → KV-transfer queuing → transfer time → TPOT → E2EL
     panels = [
-        ("① 요청큐 대기 (초) — prefill 슬롯 대기", series("prefill_queue")),
-        ("② 온전한 prefill 시간 (초)", series("prefill_compute")),
-        ("③ KV캐시 전송큐 대기 (초) — 버퍼대기·보통 최대", series("decode_queue")),
-        ("④ 보내는 시간 (초) — KV 노드간 전송", series("kv_transfer")),
-        ("⑤ 온전한 decode 시간 (초)", series("decode")),
-        ("⑥ TTFT (초) — 도착→첫토큰 ≈ ①+②+③+④", series("ttft_recon")),
-        ("⑦ TPOT (초) — 토큰당 (=⑤÷(OSL-1))", tpot_series()),
-        ("⑧ e2e 요청시간 (초) — 공식 client E2EL", series("e2el")),
+        ("Queuing delay (s)", series("prefill_queue")),
+        ("TTFT (s)", series("ttft_recon")),
+        ("KV-cache transfer queuing delay (s)", series("decode_queue")),
+        ("KV-cache transfer time (s)", series("kv_transfer")),
+        ("TPOT (s)", tpot_series()),
+        ("End-to-end latency, E2EL (s)", series("e2el")),
     ]
     x = np.arange(len(labels))
     w = 0.27
-    fig, axes = plt.subplots(2, 4, figsize=(23, 10))
-    fig.suptitle("요청 지연 분해 — 포인트별 mean / p50 / p99 (perf_metrics, warmup 제외; 빨강계열=대기, 파랑계열=작업은 본문 표 참조)")
+    fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+    fig.suptitle("Latency decomposition per point — mean / p50 / p99  (perf_metrics, warmup-filtered)")
     for ax, (title, data) in zip(axes.flat, panels):
         m = [_num(d.get("mean")) for d in data]
         p5 = [_num(d.get("p50")) for d in data]
@@ -671,7 +693,7 @@ def plot_latency_decomp(all_stats: dict, out_dir: Path) -> None:
         ax.bar(x, p5, w, label="p50")
         ax.bar(x + w, p9, w, label="p99")
         ax.set_xticks(x); ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=7)
-        ax.set_title(title, fontsize=10); ax.legend(fontsize=7); ax.grid(axis="y", alpha=0.3)
+        ax.set_title(title, fontsize=11); ax.legend(fontsize=8); ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     fname = out_dir / "compare_latency_decomp.png"
     fig.savefig(fname, dpi=120); plt.close(fig)
@@ -698,31 +720,31 @@ def plot_perside_compare(all_stats: dict, out_dir: Path) -> None:
                 ax.plot(xi, b, marker="_", color="k")
 
     fig, axes = plt.subplots(1, 3, figsize=(20, 5))
-    fig.suptitle("포인트별 per-side 처리량 · 동시성")
+    fig.suptitle("Per-side throughput & concurrency per point")
     w = 0.38
-    # A: per-side 완료율 (prefill이 요청 끝내는 속도 vs decode가 끝내는 속도)
+    # A: per-side request completion rate (prefill finishes vs decode finishes)
     ax = axes[0]
     pf = [g(c, p, "prefill_done_rps") for c, p in pts]
     dc = [g(c, p, "decode_done_rps") for c, p in pts]
-    ax.bar(x - w / 2, pf, w, label="prefill 완료율 (req/s)")
-    ax.bar(x + w / 2, dc, w, label="decode 완료율 (req/s)")
-    ax.set_title("요청 완료율 = N ÷ (첫완료~끝완료 구간)  ·  prefill>decode면 decode가 병목")
+    ax.bar(x - w / 2, pf, w, label="prefill completion rate")
+    ax.bar(x + w / 2, dc, w, label="decode completion rate")
+    ax.set_title("Per-side completion rate (req/s)  ·  prefill>decode ⇒ decode is the bottleneck")
     # B: concurrent batch (mean bar + max whisker)
     ax = axes[1]
     pfb = [g(c, p, "pf_bsz") for c, p in pts]
     dcb = [g(c, p, "dc_bsz") for c, p in pts]
     dcbmax = [g(c, p, "dc_bsz_max") for c, p in pts]
-    ax.bar(x - w / 2, pfb, w, label="prefill 동시배치 (평균)")
-    ax.bar(x + w / 2, dcb, w, label="decode 동시배치 (평균)")
+    ax.bar(x - w / 2, pfb, w, label="prefill batch (mean)")
+    ax.bar(x + w / 2, dcb, w, label="decode batch (mean)")
     whisker(ax, x + w / 2, dcb, dcbmax)
-    ax.set_title("동시 배치수  (막대=활성평균, 수염=decode 최대)")
+    ax.set_title("Concurrent batch  (bar = active mean, whisker = decode max)")
     # C: backlog (mean bar + max whisker)
     ax = axes[2]
     bl = [g(c, p, "backlog") for c, p in pts]
     blmax = [g(c, p, "backlog_max") for c, p in pts]
-    ax.bar(x, bl, w, label="backlog (평균)", color="tab:green")
+    ax.bar(x, bl, w, label="backlog (mean)", color="tab:green")
     whisker(ax, x, bl, blmax)
-    ax.set_title("backlog = prefill끝·decode대기 중인 요청  (막대=평균, 수염=최대)")
+    ax.set_title("Transfer-pool backlog: prefilled, awaiting decode  (bar = mean, whisker = max)")
     for ax in axes:
         ax.set_xticks(x); ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=7)
         ax.legend(fontsize=7); ax.grid(axis="y", alpha=0.3)
