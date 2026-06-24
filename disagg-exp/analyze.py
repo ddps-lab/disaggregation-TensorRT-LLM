@@ -475,7 +475,7 @@ def _file_index() -> str:
     return "\n".join([
         "REPORT.md      이 파일 — 핵심표 + 지표뜻 + 폴더안내",
         "data.csv       전체 수치(모든 메트릭, RAW, 논문용)",
-        "plots/         timeseries_<pt>.png(포인트별 시간순) · grid_compare_*.png(rate별 비교)",
+        "plots/         timeseries_<pt>.png(포인트별 시간순) · compare_latency_decomp.png(단계분해 mean/p50/p99) · compare_perside.png(per-side rps·배치·backlog)",
         "raw/           원본 JSON 전부(기록용): latency_throughput / perside_rps / kv_transfer /",
         "               perside_batch_kv_backlog / timeseries.jsonl",
         "metadata.json  설정(모델·ctx/gen TP·PP·placement)",
@@ -501,7 +501,7 @@ def write_report(config: str, config_dir: Path, stats_one: dict) -> None:
         f"- 토폴로지: {topo}  ·  배치: {meta.get('placement','?')}-node  ·  KV전송: {meta.get('cache_transceiver_backend','?')}",
         "- 부하: 공식 benchmark_serving (open-loop, Poisson). point = p{prefill}_d{decode}_r{rate}", "",
         "## 핵심 결과", _headline_md(stats_one), "",
-        "> 핵심표는 단계분해(초)·처리량·decode배치·backlog. 공식 TTFT/TPOT/E2EL·per-side rps·전체 수치 = `data.csv` · 시간순 = `plots/timeseries_*.png` · rate별 = `plots/grid_compare_*.png`", "",
+        "> 핵심표는 단계분해(초)·처리량·decode배치·backlog. 공식 TTFT/TPOT/E2EL·per-side rps·전체 수치 = `data.csv` · 시간순 = `plots/timeseries_*.png` · 포인트 비교 = `plots/compare_latency_decomp.png`(지연 단계분해)·`compare_perside.png`(per-side)", "",
         "## 지표 뜻 / 출처·식", "```", metric_glossary(), "```", "",
         "## 이 폴더 안내", "```", _file_index(), "```",
     ]
@@ -594,60 +594,6 @@ def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
     fig.savefig(fname, dpi=120)
     plt.close(fig)
     print(f"  saved {fname}")
-
-
-def plot_comparison(all_stats: dict[str, dict[str, dict]], out_dir: Path) -> None:
-    """[grid 비교] (prefill_len, decode_len) 쌍마다 1장, 4패널 vs rate(여러 config 겹쳐):
-    TTFT / per-side 완료 rps(prefill vs decode) / output throughput / batch & backlog.
-    = rate(grid)에 따라 메트릭이 어떻게 변하는지. (포인트별 시간순은 plot_timeseries 참조.)"""
-    if not HAS_MPLOT:
-        print("matplotlib not available, skipping plots")
-        return
-
-    by_pd: dict[tuple, dict[str, list]] = defaultdict(dict)
-    for config, points in all_stats.items():
-        for point_id, s in points.items():
-            try:
-                pl, dl, r = parse_point_id(point_id)
-            except Exception:
-                continue
-            by_pd[(pl, dl)].setdefault(config, []).append((r, s))
-
-    for (pl, dl), config_data in by_pd.items():
-        fig, axes = plt.subplots(1, 4, figsize=(20, 4))
-        fig.suptitle(f"prefill={pl} decode={dl}")
-
-        for config, rate_stats in sorted(config_data.items()):
-            rate_stats.sort(key=lambda x: x[0])
-            rates  = [x[0] for x in rate_stats]
-            ttft50 = [_num(x[1].get("ttft_p50_s")) for x in rate_stats]
-            ttft99 = [_num(x[1].get("ttft_p99_s")) for x in rate_stats]
-            thr     = [_num(x[1].get("out_tok_s")) for x in rate_stats]
-            pf_rps  = [_num(x[1].get("prefill_rps")) for x in rate_stats]
-            dc_rps  = [_num(x[1].get("decode_rps")) for x in rate_stats]
-            pf_bsz  = [_num(x[1].get("pf_bsz")) for x in rate_stats]
-            dc_bsz  = [_num(x[1].get("dc_bsz")) for x in rate_stats]
-            backlog = [_num(x[1].get("backlog")) for x in rate_stats]
-
-            axes[0].plot(rates, ttft50, marker="o", label=f"{config} p50")
-            axes[0].plot(rates, ttft99, marker="x", linestyle="--", label=f"{config} p99")
-            axes[1].plot(rates, pf_rps, marker="o", label=f"{config} prefill")
-            axes[1].plot(rates, dc_rps, marker="s", linestyle="--", label=f"{config} decode")
-            axes[2].plot(rates, thr, marker="o", label=config)
-            axes[3].plot(rates, pf_bsz, marker="o", label=f"{config} pf_bsz")
-            axes[3].plot(rates, dc_bsz, marker="s", linestyle="--", label=f"{config} dc_bsz")
-            axes[3].plot(rates, backlog, marker="^", linestyle=":", label=f"{config} backlog")
-
-        axes[0].set_title("TTFT (s)");         axes[0].set_xlabel("rate (req/s)"); axes[0].legend(fontsize=7)
-        axes[1].set_title("per-side completion rps (prefill vs decode)"); axes[1].set_xlabel("rate (req/s)"); axes[1].legend(fontsize=7)
-        axes[2].set_title("output throughput (tok/s)"); axes[2].set_xlabel("rate (req/s)"); axes[2].legend(fontsize=7)
-        axes[3].set_title("batch & backlog (req)"); axes[3].set_xlabel("rate (req/s)"); axes[3].legend(fontsize=7)
-
-        fig.tight_layout()
-        fname = out_dir / f"grid_compare_p{pl}_d{dl}.png"
-        fig.savefig(fname, dpi=120)
-        plt.close(fig)
-        print(f"  saved {fname}")
 
 
 def plot_latency_decomp(all_stats: dict, out_dir: Path) -> None:
@@ -804,7 +750,6 @@ def main(args: argparse.Namespace) -> None:
         # ② grid 비교(vs rate) → config 1개면 그 config의 plots/, 여러 개면 results/plots/(교차)
         comp_dir = (log_dir / next(iter(all_stats)) / "plots") if len(all_stats) == 1 else (log_dir / "plots")
         comp_dir.mkdir(parents=True, exist_ok=True)
-        plot_comparison(all_stats, comp_dir)
         plot_latency_decomp(all_stats, comp_dir)   # compare #1: 지연 단계분해 mean/p50/p99
         plot_perside_compare(all_stats, comp_dir)  # compare #2: per-side rps·배치·backlog
 
