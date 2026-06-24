@@ -298,13 +298,21 @@ results/
 ├── nvidia_smi.csv      ifstat.csv   dcgm.log  # 1Hz/2s 시스템 메트릭 (setup.sh 수집기)
 ├── clock_baseline_<host>.txt  s3_sync.log
 ├── .pid_nvidia_dmon  .pid_ifstat  .pid_dcgm_loop  .pid_telemetry_sync  # 마지막=node2 sync_telemetry.sh
-└── <config>/                                  # 예: T1/, smoke/
-    ├── bench_p{pl}_d{dl}_r{rate}.json         # 공식 benchmark_serving 결과 (TTFT/TPOT/ITL/E2EL/throughput)
-    ├── prom_p{pl}_d{dl}_r{rate}.json          # per-side 카운터 스냅샷 (prefill/decode RPS)
-    ├── perf_p{pl}_d{dl}_r{rate}.json          # /perf_metrics 스냅샷 (KV전송시간 등)
+└── <config>/                                  # 예: T1/, smoke/   (point = p{prefill}_d{decode}_r{rate})
+    ├── latency_throughput_<pt>.json           # 공식 benchmark_serving 결과 (TTFT/TPOT/ITL/E2EL/throughput)
+    ├── perside_rps_<pt>.json                  # per-side 완료 카운터 스냅샷 (prefill/decode RPS)
+    ├── kv_transfer_<pt>.json                  # /perf_metrics 스냅샷 (per-request KV전송시간)
+    ├── perside_batch_kv_backlog_<pt>.json     # 워커 /metrics 집계 (배치수·KV풀·backlog mean/max)
+    ├── timeseries_<pt>.jsonl                  # 1Hz per-tick 스냅샷 (시간순 동역학 원본)
+    ├── timeseries_<pt>.png                    # ← analyze --plot: 포인트별 시간순(배치/backlog/누적완료)
+    ├── grid_compare_p{pl}_d{dl}.png           # ← analyze --plot: rate(grid)별 비교 (config 1개일 때 여기)
+    ├── summary_<config>.txt / .csv            # ← analyze: 표(txt) + RAW 수치(csv, 논문용)  ※log-dir 루트에 저장
     ├── .done_* / .failed_*                    # resume 마커
     └── metadata.json                          # config·ctx/gen TP·PP·placement·load_tool
 ```
+> 파일명 = "내용"으로 자기설명적. point_id `p1024_d512_r1.0` = prefill 1024 / decode 512 / rate 1.0.
+> analyze `--plot`: **포인트별 시간순**(`timeseries_<pt>.png`) + **grid 비교**(`grid_compare_*.png`)를
+> 둘 다 생성. config 1개면 그 폴더에, 여러 개 비교면 grid는 `results/plots/`에.
 
 **기동 에러 추적**: 워커가 즉시 죽으면 `trtllm_<LABEL>_context_*.log` 끝부분 확인 (대부분 extra YAML 키 오타 → `ValidationError`).
 

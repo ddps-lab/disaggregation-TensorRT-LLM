@@ -19,10 +19,12 @@ S3 sync (embedded — runs as a background thread while sweep is active):
     S3_SYNC_INTERVAL=30                       # seconds between syncs
     --s3-bucket ""                            # disable
 
-각 포인트가 남기는 산출물 ($EXP_LOG_DIR/<config>/):
-    bench_<point_id>.json   # benchmark_serving --save-result (TTFT/TPOT/ITL/E2EL/throughput)
-    prom_<point_id>.json    # per-side 카운터 스냅샷 (prefill/decode RPS 산출용)
-    perf_<point_id>.json    # /perf_metrics (KV전송시간)
+각 포인트가 남기는 산출물 ($EXP_LOG_DIR/<config>/, point_id=p{prefill}_d{decode}_r{rate}):
+    latency_throughput_<pt>.json        # benchmark_serving --save-result (TTFT/TPOT/ITL/E2EL/throughput)
+    perside_rps_<pt>.json               # per-side 카운터 스냅샷 (prefill/decode RPS 산출용)
+    kv_transfer_<pt>.json               # /perf_metrics (KV전송시간)
+    perside_batch_kv_backlog_<pt>.json  # 워커 /metrics 집계 (배치수·KV풀·backlog)
+    timeseries_<pt>.jsonl               # 1Hz per-tick 스냅샷 (시간순 동역학 → analyze가 timeseries_<pt>.png)
 """
 
 import argparse
@@ -99,6 +101,14 @@ MEASURED_N = int(os.environ.get("SWEEP_MEASURED_N", "300"))  # 실전 측정 요
 LOG_DIR = os.environ.get("EXP_LOG_DIR", "./results")  # 모든 결과 파일의 저장 경로
 
 MODEL_NAME = os.environ.get("MODEL", "Qwen/Qwen3-4B")  # launch_trtllm.sh의 MODEL과 일치(benchmark_serving --model)
+
+# 결과 파일명 — 자기설명적(폴더만 봐도 내용 알게). point_id = p{prefill}_d{decode}_r{rate}.
+#   analyze.py의 F_* 상수와 반드시 동일하게 유지(쓰기=여기, 읽기=analyze).
+F_BENCH = "latency_throughput"        # 공식 benchmark_serving: TTFT/TPOT/ITL/E2EL/throughput
+F_PROM = "perside_rps"                # orchestrator ctx/gen 완료 카운터 → prefill/decode RPS
+F_PERF = "kv_transfer"                # /perf_metrics: per-request KV전송 시간
+F_BATCH = "perside_batch_kv_backlog"  # 워커 /metrics 집계: 배치수·KV풀·backlog
+F_LIVE = "timeseries"                 # 1Hz per-tick 스냅샷(.jsonl) — 시간순 동역학
 
 
 # ── 공식 부하 도구 (benchmark_serving) 호출 ────────────────────────────────────
@@ -465,7 +475,7 @@ async def main(args: argparse.Namespace) -> None:
     skipped = 0
     for prefill_len, decode_len, rate in points:
         point_id = f"p{prefill_len}_d{decode_len}_r{rate}"  # 파일명 = 실험 조건
-        bench_file = f"bench_{point_id}.json"                # benchmark_serving --save-result 결과
+        bench_file = f"{F_BENCH}_{point_id}.json"            # benchmark_serving --save-result 결과
         marker_done   = out_dir / f".done_{point_id}"        # 완료 도장 (재실행 시 스킵)
         marker_failed = out_dir / f".failed_{point_id}"      # 실패 도장
 
@@ -479,9 +489,9 @@ async def main(args: argparse.Namespace) -> None:
         try:
             ok = await run_point(base_url, config, prefill_len, decode_len, rate,
                                  result_filename=bench_file, out_dir=out_dir,
-                                 prom_out=out_dir / f"prom_{point_id}.json",
-                                 batch_out=out_dir / f"batch_{point_id}.json",
-                                 live_out=out_dir / f"live_{point_id}.jsonl")
+                                 prom_out=out_dir / f"{F_PROM}_{point_id}.json",
+                                 batch_out=out_dir / f"{F_BATCH}_{point_id}.json",
+                                 live_out=out_dir / f"{F_LIVE}_{point_id}.jsonl")
         except Exception as exc:
             print(f"  ERROR: {exc}", flush=True)
             marker_failed.touch()
@@ -491,7 +501,7 @@ async def main(args: argparse.Namespace) -> None:
             marker_done.touch()
             marker_failed.unlink(missing_ok=True)
             # KV전송시간 등 per-request perf 수집 (측정 종료 후 1회). 비활성이면 조용히 skip.
-            await fetch_perf_metrics(base_url, out_dir / f"perf_{point_id}.json")
+            await fetch_perf_metrics(base_url, out_dir / f"{F_PERF}_{point_id}.json")
         else:
             marker_failed.touch()
 

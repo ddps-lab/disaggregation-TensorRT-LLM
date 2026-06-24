@@ -35,6 +35,15 @@ except ImportError:
 #     단가를 측정 throughput에 곱해 외부 계산한다.
 
 
+# 결과 파일명 — 자기설명적(폴더만 봐도 내용 알게). point_id = p{prefill}_d{decode}_r{rate}.
+#   sweep.py와 반드시 동일하게 유지(쓰기=sweep, 읽기=여기).
+F_BENCH = "latency_throughput"        # 공식 benchmark_serving: TTFT/TPOT/ITL/E2EL/throughput
+F_PROM = "perside_rps"                # orchestrator ctx/gen 완료 카운터 → prefill/decode RPS
+F_PERF = "kv_transfer"                # /perf_metrics: per-request KV전송 시간
+F_BATCH = "perside_batch_kv_backlog"  # 워커 /metrics 집계: 배치수·KV풀·backlog
+F_LIVE = "timeseries"                 # 1Hz per-tick 스냅샷(.jsonl) — 시간순 동역학
+
+
 def _p(arr: list[float], pct: float) -> float:
     if not arr:
         return float("nan")
@@ -58,17 +67,17 @@ def parse_point_id(point_id: str) -> tuple[int, int, float]:
 
 
 def list_points(config_dir: Path) -> list[str]:
-    """config 디렉토리의 bench_<point>.json들에서 point_id 목록 추출."""
+    """config 디렉토리의 latency_throughput_<point>.json들에서 point_id 목록 추출."""
     if not config_dir.exists():
         return []
-    return sorted(p.stem[len("bench_"):] for p in config_dir.glob("bench_*.json"))
+    return sorted(p.stem[len(F_BENCH) + 1:] for p in config_dir.glob(f"{F_BENCH}_*.json"))
 
 
 def load_bench(config_dir: Path, point_id: str) -> dict:
     """bench_{point_id}.json (공식 benchmark_serving --save-result)에서 집계 메트릭을 읽음.
     percentile 키는 sweep가 넘긴 --metric-percentiles(50,99) 기준(p50_*_ms / p99_*_ms).
     파일 없음/깨짐/실패면 {'n_ok':0} → 표에 NO DATA."""
-    bf = config_dir / f"bench_{point_id}.json"
+    bf = config_dir / f"{F_BENCH}_{point_id}.json"
     if not bf.exists():
         return {"n_ok": 0}
     try:
@@ -116,7 +125,7 @@ def _warn_pt_delta(point_id: str, bench: dict) -> None:
 def load_perf(config_dir: Path, point_id: str) -> dict:
     """perf_{point_id}.json (orchestrator /perf_metrics 스냅샷)에서 KV전송시간·블록재사용 통계 추출.
     파일 없으면(=perf 비활성) 빈 dict → 표에 'n/a'. gen kv_cache_transfer_*는 kv_cache_size>0일 때만 존재."""
-    pf = config_dir / f"perf_{point_id}.json"
+    pf = config_dir / f"{F_PERF}_{point_id}.json"
     if not pf.exists():
         return {}
     try:
@@ -156,7 +165,7 @@ def load_prom(config_dir: Path, point_id: str, mean_pt: float | None, mean_ct: f
       (ctx_/gen_completed_requests_total — prom_scrape.py 참조)
     - per-side TPS는 공식 토큰 카운터가 없어(LEARNING_NOTES.md §병렬화·KV전송·per-side 6번) RPS × 토큰수로 파생.
     파일 없으면(=스크레이프 비활성/orchestrator 미노출) 빈 dict → 표에 'n/a'."""
-    pf = config_dir / f"prom_{point_id}.json"
+    pf = config_dir / f"{F_PROM}_{point_id}.json"
     if not pf.exists():
         return {}
     try:
@@ -198,7 +207,7 @@ def load_batch(config_dir: Path, point_id: str) -> dict:
     """batch_<point>.json (워커 /metrics 샘플) → per-side 배치수·KV사용 (mean). 없으면 {}.
     pf_bsz=prefill 평균 배치(numContextRequests), dc_bsz=decode 평균 배치(numGenRequests),
     dc_kv_pct=decode KV풀 사용률(usedNumBlocks/maxNumBlocks)."""
-    p = config_dir / f"batch_{point_id}.json"
+    p = config_dir / f"{F_BATCH}_{point_id}.json"
     if not p.exists():
         return {}
     try:
@@ -289,9 +298,78 @@ def write_csv(all_stats: dict[str, dict[str, dict]], path: Path) -> None:
             ])
 
 
+def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
+    """[grid 포인트 1개의 시간순 동역학] timeseries_<point>.jsonl(1Hz per-tick)를 읽어
+    3패널 시계열을 그 config 폴더에 저장:
+      ① 동시 배치수(prefill/decode)가 시간에 따라 어떻게 변하나
+      ② backlog = prefill 끝났는데 decode 대기 중인 요청수(프리필 큐에 쌓인 양)
+      ③ 누적 완료수(ctx=prefill, gen=decode) — 총 처리가 어떻게 진행되나
+    (배치수는 enable_iter_perf_stats:true여야 채워짐. null이면 그 패널만 'n/a' 표시.)"""
+    if not HAS_MPLOT:
+        return
+    fp = config_dir / f"{F_LIVE}_{point_id}.jsonl"
+    if not fp.exists():
+        return
+    rows = []
+    for line in fp.read_text().splitlines():
+        line = line.strip()
+        if line:
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                pass
+    if not rows:
+        return
+
+    def xy(key):  # 값이 None 아닌 (t, value)만
+        xs = [r.get("t") for r in rows if r.get(key) is not None]
+        ys = [r.get(key) for r in rows if r.get(key) is not None]
+        return xs, ys
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+    fig.suptitle(f"{config}  {point_id}  (시간순 — t=측정시작 후 초)")
+
+    # ① 동시 배치수
+    ax = axes[0]
+    pf_x, pf_y = xy("pf_bsz")
+    dc_x, dc_y = xy("dc_bsz")
+    if pf_x:
+        ax.plot(pf_x, pf_y, marker=".", label="prefill batch")
+    if dc_x:
+        ax.plot(dc_x, dc_y, marker=".", label="decode batch")
+    if not pf_x and not dc_x:
+        ax.text(0.5, 0.5, "batch n/a\n(enable_iter_perf_stats:true 후 재측정)",
+                ha="center", va="center", transform=ax.transAxes, fontsize=9)
+    ax.set_title("동시 배치수 (req)"); ax.set_xlabel("t (s)"); ax.set_ylabel("batch"); ax.legend(fontsize=8)
+
+    # ② backlog (prefill 큐에 쌓인 수)
+    ax = axes[1]
+    bx, by = xy("backlog")
+    if bx:
+        ax.plot(bx, by, marker=".", color="tab:green", label="backlog (ctx_done−gen_done)")
+    ax.set_title("backlog = prefill끝·decode대기 (req)"); ax.set_xlabel("t (s)"); ax.set_ylabel("req"); ax.legend(fontsize=8)
+
+    # ③ 누적 완료수
+    ax = axes[2]
+    cx, cy = xy("ctx_done")
+    gx, gy = xy("gen_done")
+    if cx:
+        ax.plot(cx, cy, marker=".", label="ctx_done (prefill 누적)")
+    if gx:
+        ax.plot(gx, gy, marker=".", linestyle="--", label="gen_done (decode 누적)")
+    ax.set_title("누적 완료수 (기울기=처리율)"); ax.set_xlabel("t (s)"); ax.set_ylabel("requests"); ax.legend(fontsize=8)
+
+    fig.tight_layout()
+    fname = config_dir / f"{F_LIVE}_{point_id}.png"
+    fig.savefig(fname, dpi=120)
+    plt.close(fig)
+    print(f"  saved {fname}")
+
+
 def plot_comparison(all_stats: dict[str, dict[str, dict]], out_dir: Path) -> None:
-    """One plot per (prefill_len, decode_len) pair, 4 panels vs rate, all configs:
-    TTFT / per-side 완료 rps(prefill vs decode) / output throughput / batch & backlog."""
+    """[grid 비교] (prefill_len, decode_len) 쌍마다 1장, 4패널 vs rate(여러 config 겹쳐):
+    TTFT / per-side 완료 rps(prefill vs decode) / output throughput / batch & backlog.
+    = rate(grid)에 따라 메트릭이 어떻게 변하는지. (포인트별 시간순은 plot_timeseries 참조.)"""
     if not HAS_MPLOT:
         print("matplotlib not available, skipping plots")
         return
@@ -336,7 +414,7 @@ def plot_comparison(all_stats: dict[str, dict[str, dict]], out_dir: Path) -> Non
         axes[3].set_title("batch & backlog (req)"); axes[3].set_xlabel("rate (req/s)"); axes[3].legend(fontsize=7)
 
         fig.tight_layout()
-        fname = out_dir / f"plot_p{pl}_d{dl}.png"
+        fname = out_dir / f"grid_compare_p{pl}_d{dl}.png"
         fig.savefig(fname, dpi=120)
         plt.close(fig)
         print(f"  saved {fname}")
@@ -383,9 +461,18 @@ def main(args: argparse.Namespace) -> None:
     print(f"[analyze] CSV 저장 → {summary_csv}")
 
     if args.plot:
-        out_dir = log_dir / "plots"
-        out_dir.mkdir(exist_ok=True)
-        plot_comparison(all_stats, out_dir)
+        # ① 포인트별 시간순 동역학 → 각 config 폴더 (results/<config>/timeseries_<pt>.png)
+        for config in all_stats:
+            cdir = log_dir / config
+            for point_id in all_stats[config]:
+                plot_timeseries(config, point_id, cdir)
+        # ② grid 비교(vs rate) → config 1개면 그 폴더, 여러 개면 results/plots/ (교차 비교)
+        if len(all_stats) == 1:
+            comp_dir = log_dir / next(iter(all_stats))
+        else:
+            comp_dir = log_dir / "plots"
+            comp_dir.mkdir(exist_ok=True)
+        plot_comparison(all_stats, comp_dir)
 
 
 if __name__ == "__main__":
