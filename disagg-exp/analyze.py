@@ -87,6 +87,7 @@ def load_bench(config_dir: Path, point_id: str) -> dict:
         "n_ok": completed,
         "num_prompts": num_prompts,
         "fail_rate": fail_rate,
+        "fail_pct": fail_rate * 100,
         "ttft_p50_ms": d.get("p50_ttft_ms"),
         "ttft_p99_ms": d.get("p99_ttft_ms"),
         "tpot_p50_ms": d.get("p50_tpot_ms"),
@@ -221,39 +222,50 @@ def load_batch(config_dir: Path, point_id: str) -> dict:
         out["backlog"] = d["backlog_mean"]
     if d.get("backlog_max") is not None:
         out["backlog_max"] = d["backlog_max"]
+    # 바쁜 시간 비율(%) — prefill이 "끝내고 노는" 정도가 여기 보임(낮을수록 idle 많음)
+    if d.get("prefill_active_frac") is not None:
+        out["pf_act"] = d["prefill_active_frac"] * 100
+    if d.get("decode_active_frac") is not None:
+        out["dc_act"] = d["decode_active_frac"] * 100
     return out
 
 
 def print_table(all_stats: dict[str, dict[str, dict]]) -> None:
-    header = (
-        f"{'config':<8} {'point':<28} {'n_ok':>6} {'fail%':>6}"
-        f" {'ttft_p50':>9} {'ttft_p99':>9} {'tpot_p50':>9} {'tpot_p99':>9}"
-        f" {'itl_p99':>8} {'e2el_p99':>9} {'out_tok/s':>10}"
-        f" {'kv_p50':>8} {'kv_p99':>8} {'pf_rps':>7} {'dc_rps':>7} {'pf_tps':>8} {'dc_tps':>8}"
-        f" {'pf_bsz':>7} {'dc_bsz':>7} {'dc_kv%':>7} {'backlog':>8}"
-    )
-    print(header)
-    print("-" * len(header))
-
-    for config in sorted(all_stats):
-        for point_id in sorted(all_stats[config]):
-            s = all_stats[config][point_id]
-            if s.get("n_ok", 0) == 0:
-                print(f"{config:<8} {point_id:<28} {'NO DATA':>6}")
-                continue
-            fail_pct = s.get("fail_rate")
-            fail_s = f"{fail_pct*100:>5.1f}%" if isinstance(fail_pct, (int, float)) and fail_pct == fail_pct else f"{'n/a':>6}"
-            print(
-                f"{config:<8} {point_id:<28} {s['n_ok']:>6} {fail_s}"
-                f" {_fmt(s.get('ttft_p50_ms'),9)} {_fmt(s.get('ttft_p99_ms'),9)}"
-                f" {_fmt(s.get('tpot_p50_ms'),9)} {_fmt(s.get('tpot_p99_ms'),9)}"
-                f" {_fmt(s.get('itl_p99_ms'),8)} {_fmt(s.get('e2el_p99_ms'),9)}"
-                f" {_fmt(s.get('out_tok_s'),10)}"
-                f" {_fmt(s.get('kv_transfer_p50_ms'),8,2)} {_fmt(s.get('kv_transfer_p99_ms'),8,2)}"
-                f" {_fmt(s.get('prefill_rps'),7,2)} {_fmt(s.get('decode_rps'),7,2)}"
-                f" {_fmt(s.get('prefill_tps'),8,0)} {_fmt(s.get('decode_tps'),8,0)}"
-                f" {_fmt(s.get('pf_bsz'),7,2)} {_fmt(s.get('dc_bsz'),7,2)} {_fmt(s.get('dc_kv_pct'),7,1)} {_fmt(s.get('backlog'),8,1)}"
-            )
+    """한 줄에 다 박지 않고 카테고리별 4개 서브-표로 출력. 모든 표의 행 키 = (config, point).
+    컬럼 스펙: (표시이름, stats키, 너비, 소수자리)."""
+    groups = [
+        ("① 지연 latency (ms)", [
+            ("n_ok", "n_ok", 5, 0), ("fail%", "fail_pct", 6, 1),
+            ("ttft_p50", "ttft_p50_ms", 9, 1), ("ttft_p99", "ttft_p99_ms", 9, 1),
+            ("tpot_p50", "tpot_p50_ms", 9, 2), ("tpot_p99", "tpot_p99_ms", 9, 2),
+            ("itl_p99", "itl_p99_ms", 8, 2), ("e2el_p99", "e2el_p99_ms", 9, 1),
+        ]),
+        ("② 처리량 throughput + KV전송(ms)", [
+            ("out_tok/s", "out_tok_s", 10, 1),
+            ("kv_p50", "kv_transfer_p50_ms", 8, 2), ("kv_p99", "kv_transfer_p99_ms", 8, 2),
+        ]),
+        ("③ per-side 완료율·토큰 (prefill vs decode)", [
+            ("pf_rps", "prefill_rps", 8, 2), ("dc_rps", "decode_rps", 8, 2),
+            ("pf_tps", "prefill_tps", 8, 0), ("dc_tps", "decode_tps", 8, 0),
+        ]),
+        ("④ per-side 배치·점유·backlog (배치=처리중 평균, act%=바쁜시간, backlog=쌓인수)", [
+            ("pf_bsz", "pf_bsz", 7, 2), ("dc_bsz", "dc_bsz", 7, 2),
+            ("pf_act%", "pf_act", 8, 1), ("dc_act%", "dc_act", 8, 1),
+            ("dc_kv%", "dc_kv_pct", 7, 1), ("backlog", "backlog", 8, 1),
+        ]),
+    ]
+    keys = [(c, p) for c in sorted(all_stats) for p in sorted(all_stats[c])]
+    for title, cols in groups:
+        hdr = f"{'config':<8} {'point':<24}" + "".join(f" {n:>{w}}" for n, _, w, _ in cols)
+        print(f"\n── {title} ──")
+        print(hdr)
+        print("-" * len(hdr))
+        for c, p in keys:
+            s = all_stats[c][p]
+            row = f"{c:<8} {p:<24}"
+            for _, key, w, prec in cols:
+                row += f" {_fmt(s.get(key), w, prec)}"
+            print(row)
 
 
 def plot_comparison(all_stats: dict[str, dict[str, dict]], out_dir: Path) -> None:
