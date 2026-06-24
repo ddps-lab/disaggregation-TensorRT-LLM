@@ -656,11 +656,14 @@ def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
 
 
 def plot_latency_decomp(all_stats: dict, out_dir: Path) -> None:
-    """[compare #1] 요청 지연 분해, 포인트별 mean/p50/p99 묶음막대. 라벨은 영어(논문 표준 워딩).
-    순서(사용자 스펙): Queuing delay → TTFT → KV-cache transfer queuing delay → KV-cache transfer time
-    → TPOT → E2EL. TTFT/TPOT에 prefill/decode 원시단계 섞지 않음. (perf_metrics, warmup 제외.)
-      매핑: Queuing delay=prefill_queue, transfer queuing delay=decode_queue(전송풀 대기),
-            transfer time=kv_transfer, E2EL=공식 client E2EL."""
+    """[compare #1] 요청 지연 분해 — 사용자 정의 5개 순차·절대 비겹침 단계 + E2EL(전체).
+    [1] Queuing delay = prefill_queue (ca→cfs, 큐 대기)
+    [2] TTFT = prefill_compute (cfs→cft, "큐에서 나와 prefill 시작→첫토큰", 큐 제외 순수계산!)
+    [3] transfer pool wait = transfer_pool_wait (ga→ts)
+    [4] transfer time = kv_transfer (ts→te)
+    [5] TPOT = decode/(OSL-1)
+    [total] E2EL = 공식 client (요청 전체). 전수검증: [1]~[5] 겹침 0 (903요청). (perf_metrics, warmup 제외.)
+    ※주의: 여기 TTFT는 표준 TTFT(도착~첫토큰)가 아니라 사용자 정의(큐 제외 순수 prefill)."""
     if not HAS_MPLOT:
         return
     pts = [(c, p) for c in sorted(all_stats) for p in sorted(all_stats[c])]
@@ -684,21 +687,22 @@ def plot_latency_decomp(all_stats: dict, out_dir: Path) -> None:
         return out
 
     # request lifecycle order (user spec): queuing delay → TTFT → KV-transfer queuing → transfer time → TPOT → E2EL
-    # atoms = non-overlapping (Queuing delay, transfer pool wait, transfer time, TPOT·decode).
-    # TTFT & E2EL = SUMMARY totals (contain the atoms) — labeled [sum] so they aren't read as separate slices.
+    # [1]~[5] = 사용자 정의 순차·절대 비겹침 단계. TTFT = "큐에서 나와 prefill 시작→첫토큰"(큐 제외 순수계산).
+    #   타임라인: ca→cfs(큐) cfs→cft(TTFT) ga→ts(풀대기) ts→te(전송) ...decode(TPOT). 검증: 겹침 0.
+    # E2EL = [total] (요청 전체 = 모든 단계 합), 5개와 별개로 참고용.
     panels = [
-        ("Queuing delay (s)  [atom]", series("prefill_queue")),
-        ("TTFT (s)  [sum: arrival→first token]", series("ttft_recon")),
-        ("KV-cache transfer pool wait (s)  [atom]", series("transfer_pool_wait")),
-        ("KV-cache transfer time (s)  [atom]", series("kv_transfer")),
-        ("TPOT (s)  [atom: decode/(OSL-1)]", tpot_series()),
-        ("End-to-end latency, E2EL (s)  [sum: whole request]", series("e2el")),
+        ("[1] Queuing delay (s)", series("prefill_queue")),
+        ("[2] TTFT (s) — out of queue → first token (queue-excluded)", series("prefill_compute")),
+        ("[3] KV-cache transfer pool wait (s)", series("transfer_pool_wait")),
+        ("[4] KV-cache transfer time (s)", series("kv_transfer")),
+        ("[5] TPOT (s) — decode/(OSL-1)", tpot_series()),
+        ("[total] End-to-end latency, E2EL (s)", series("e2el")),
     ]
     x = np.arange(len(labels))
     w = 0.27
     fig, axes = plt.subplots(2, 3, figsize=(20, 10))
-    fig.suptitle("Latency decomposition per point — mean / p50 / p99  (perf_metrics, warmup-filtered).  "
-                 "[atom] = non-overlapping;  [sum] TTFT⊃(Queuing+transfer pool wait+transfer time),  E2EL⊃all")
+    fig.suptitle("Latency decomposition — [1]→[5] are sequential NON-OVERLAPPING stages of one request; "
+                 "[total]=E2EL (whole request).  mean / p50 / p99, warmup-filtered")
     for ax, (title, data) in zip(axes.flat, panels):
         m = [_num(d.get("mean")) for d in data]
         p5 = [_num(d.get("p50")) for d in data]
