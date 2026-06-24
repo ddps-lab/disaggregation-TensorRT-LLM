@@ -380,6 +380,13 @@ _TABLE_GROUPS = [
         ("backlog_waiting_reqs_mean", "backlog", 0, 1),
         ("backlog_waiting_reqs_max", "backlog_max", 0, 0),
     ]),
+    ("⑥ 노드 사이징 — 큐 제외 순수 서비스 용량 + 균형 P:D ([계산]) — prefill 입력tok/s=ISL/prefill_compute, decode 출력tok/s=공식 throughput", [
+        ("prefill_pure_input_tokens_per_sec", "prefill_pure_input_tps", 0, 0),
+        ("decode_output_tokens_per_sec", "decode_output_tps", 0, 0),
+        ("prefill_capacity_reqs_per_sec", "prefill_capacity_reqs_per_sec", 0, 2),
+        ("decode_capacity_reqs_per_sec", "decode_capacity_reqs_per_sec", 0, 2),
+        ("balanced_decode_nodes_per_1_prefill", "balanced_decode_nodes_per_prefill", 0, 2),
+    ]),
 ]
 
 
@@ -701,9 +708,11 @@ def plot_latency_decomp(all_stats: dict, out_dir: Path) -> None:
 
 
 def plot_perside_compare(all_stats: dict, out_dir: Path) -> None:
-    """[compare #2] 포인트별 per-side 처리량·동시성: ①요청 완료율(prefill vs decode) ②동시배치 ③backlog.
-    완료율은 perf_metrics 절대 완료시각 기반(prefill=ctx 첫토큰, decode=gen 마지막토큰)이라 1P1D라도
-    prefill이 더 좁은 구간에 끝내 prefill>decode로 갈라짐(=decode 병목). batch는 활성평균 막대 + max 수염."""
+    """[compare #2] 포인트별 per-side 처리량·동시성, 4패널:
+      ① 요청 완료율(req/s, prefill vs decode)  ② 동시배치  ③ transfer-pool backlog
+      ④ 순수 서비스 처리량(tok/s, 큐 제외): prefill 입력tok/s(=ISL/prefill_compute) vs decode 출력tok/s.
+         빨강 주석 = 균형 노드비율 1P:N·D (= prefill용량 ÷ decode용량). 노드 사이징 근거.
+    완료율은 perf_metrics 절대 완료시각 기반(1P1D라도 prefill>decode=decode 병목). batch=활성평균+max수염."""
     if not HAS_MPLOT:
         return
     pts = [(c, p) for c in sorted(all_stats) for p in sorted(all_stats[c])]
@@ -719,7 +728,7 @@ def plot_perside_compare(all_stats: dict, out_dir: Path) -> None:
                 ax.plot([xi, xi], [a, b], color="k", linewidth=0.8)
                 ax.plot(xi, b, marker="_", color="k")
 
-    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(26, 5))
     fig.suptitle("Per-side throughput & concurrency per point")
     w = 0.38
     # A: per-side request completion rate (prefill finishes vs decode finishes)
@@ -745,6 +754,18 @@ def plot_perside_compare(all_stats: dict, out_dir: Path) -> None:
     ax.bar(x, bl, w, label="backlog (mean)", color="tab:green")
     whisker(ax, x, bl, blmax)
     ax.set_title("Transfer-pool backlog: prefilled, awaiting decode  (bar = mean, whisker = max)")
+    # D: PURE service throughput (queue-excluded, tok/s) → node-sizing. red = balanced 1P : N·D nodes
+    ax = axes[3]
+    p_tps = [g(c, p, "prefill_pure_input_tps") for c, p in pts]
+    d_tps = [g(c, p, "decode_output_tps") for c, p in pts]
+    ax.bar(x - w / 2, p_tps, w, label="prefill: input tok/s (pure compute)")
+    ax.bar(x + w / 2, d_tps, w, label="decode: output tok/s")
+    ax.set_yscale("log")
+    ratios = [g(c, p, "balanced_decode_nodes_per_prefill") for c, p in pts]
+    for xi, r, pv in zip(x, ratios, p_tps):
+        if r == r and pv == pv:                       # NaN 아닌 것만
+            ax.text(xi, pv * 1.25, f"1P:{r:.1f}D", ha="center", va="bottom", fontsize=8, color="tab:red")
+    ax.set_title("Pure service throughput (tok/s, log)  ·  red = balanced nodes 1P : N·D")
     for ax in axes:
         ax.set_xticks(x); ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=7)
         ax.legend(fontsize=7); ax.grid(axis="y", alpha=0.3)
@@ -752,6 +773,33 @@ def plot_perside_compare(all_stats: dict, out_dir: Path) -> None:
     fname = out_dir / "compare_perside.png"
     fig.savefig(fname, dpi=120); plt.close(fig)
     print(f"  saved {fname}")
+
+
+def _derive_capacity(s: dict, point_id: str) -> None:
+    """큐 대기를 뺀 '순수 서비스 용량'(하드웨어 능력) + 균형 노드비율(P:D) 파생 → s에 추가.
+    노드 사이징은 throttle된 시스템율이 아니라 각 측의 순수 처리 용량으로 정해야 함.
+      prefill_pure_input_tps  = ISL ÷ prefill_compute (입력토큰/초; 큐 제외 순수 compute, 단일스트림 batch≈1)
+      decode_output_tps       = 공식 output_throughput (출력토큰/초; 포화율에서 = decode 용량)
+      prefill_capacity_reqs_per_sec = 1 ÷ prefill_compute   (prefill이 초당 처리 가능한 요청수)
+      decode_capacity_reqs_per_sec  = decode_done_rps        (decode가 초당 끝내는 요청수, 포화시=용량)
+      balanced_decode_nodes_per_prefill = prefill용량 ÷ decode용량 (1P당 필요한 D 노드 수)
+    ※가정: prefill batch≈1(관측), decode는 포화(KV풀 ~98%). 워크로드 ISL:OSL에 의존."""
+    try:
+        pl, dl, _ = parse_point_id(point_id)
+    except Exception:
+        pl = dl = None
+    isl = s.get("mean_input_len") or pl
+    pc = s.get("prefill_compute_mean_s")
+    if isinstance(isl, (int, float)) and isinstance(pc, (int, float)) and pc > 0:
+        s["prefill_pure_input_tps"] = isl / pc
+        s["prefill_capacity_reqs_per_sec"] = 1.0 / pc
+    if isinstance(s.get("out_tok_s"), (int, float)):
+        s["decode_output_tps"] = s["out_tok_s"]
+    pf_cap = s.get("prefill_capacity_reqs_per_sec")
+    dc_cap = s.get("decode_done_rps")                       # 측정된 decode 완료율(포화시=용량)
+    if isinstance(pf_cap, (int, float)) and isinstance(dc_cap, (int, float)) and dc_cap > 0:
+        s["decode_capacity_reqs_per_sec"] = dc_cap
+        s["balanced_decode_nodes_per_prefill"] = pf_cap / dc_cap
 
 
 def main(args: argparse.Namespace) -> None:
@@ -781,6 +829,7 @@ def main(args: argparse.Namespace) -> None:
             for k in list(s):
                 if k.endswith("_ms") and isinstance(s[k], (int, float)):
                     s[k[:-3] + "_s"] = s[k] / 1000.0
+            _derive_capacity(s, point_id)                                   # 순수 서비스 TPS + 균형 노드비율(P:D)
             all_stats[config][point_id] = s
 
     if not all_stats:
