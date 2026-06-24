@@ -415,8 +415,10 @@ async def fetch_perf_metrics(base_url: str, out_path: Path) -> None:
 async def main(args: argparse.Namespace) -> None:
     base_url = args.base_url.rstrip("/")
     config = args.config
-    out_dir = Path(LOG_DIR) / config  # 예: ./results/T1/
+    out_dir = Path(LOG_DIR) / config  # 예: ./results/T1/  (metadata·마커·REPORT는 여기)
     out_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir = out_dir / "raw"          # 원본 per-point JSON은 여기로 모아 폴더 정리(사람용은 out_dir 최상위)
+    raw_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 실험 영수증 생성 (나중에 "이 폴더가 뭐였지?" 할 때 보는 파일) ──
     meta_path = out_dir / "metadata.json"
@@ -488,10 +490,10 @@ async def main(args: argparse.Namespace) -> None:
 
         try:
             ok = await run_point(base_url, config, prefill_len, decode_len, rate,
-                                 result_filename=bench_file, out_dir=out_dir,
-                                 prom_out=out_dir / f"{F_PROM}_{point_id}.json",
-                                 batch_out=out_dir / f"{F_BATCH}_{point_id}.json",
-                                 live_out=out_dir / f"{F_LIVE}_{point_id}.jsonl")
+                                 result_filename=bench_file, out_dir=raw_dir,   # 원본은 raw/ 로
+                                 prom_out=raw_dir / f"{F_PROM}_{point_id}.json",
+                                 batch_out=raw_dir / f"{F_BATCH}_{point_id}.json",
+                                 live_out=raw_dir / f"{F_LIVE}_{point_id}.jsonl")
         except Exception as exc:
             print(f"  ERROR: {exc}", flush=True)
             marker_failed.touch()
@@ -501,7 +503,7 @@ async def main(args: argparse.Namespace) -> None:
             marker_done.touch()
             marker_failed.unlink(missing_ok=True)
             # KV전송시간 등 per-request perf 수집 (측정 종료 후 1회). 비활성이면 조용히 skip.
-            await fetch_perf_metrics(base_url, out_dir / f"{F_PERF}_{point_id}.json")
+            await fetch_perf_metrics(base_url, raw_dir / f"{F_PERF}_{point_id}.json")
         else:
             marker_failed.touch()
 

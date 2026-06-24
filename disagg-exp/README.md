@@ -299,20 +299,24 @@ results/
 ├── clock_baseline_<host>.txt  s3_sync.log
 ├── .pid_nvidia_dmon  .pid_ifstat  .pid_dcgm_loop  .pid_telemetry_sync  # 마지막=node2 sync_telemetry.sh
 └── <config>/                                  # 예: T1/, smoke/   (point = p{prefill}_d{decode}_r{rate})
-    ├── latency_throughput_<pt>.json           # 공식 benchmark_serving 결과 (TTFT/TPOT/ITL/E2EL/throughput)
-    ├── perside_rps_<pt>.json                  # per-side 완료 카운터 스냅샷 (prefill/decode RPS)
-    ├── kv_transfer_<pt>.json                  # /perf_metrics 스냅샷 (per-request KV전송시간)
-    ├── perside_batch_kv_backlog_<pt>.json     # 워커 /metrics 집계 (배치수·KV풀·backlog mean/max)
-    ├── timeseries_<pt>.jsonl                  # 1Hz per-tick 스냅샷 (시간순 동역학 원본)
-    ├── timeseries_<pt>.png                    # ← analyze --plot: 포인트별 시간순(배치/backlog/누적완료)
-    ├── grid_compare_p{pl}_d{dl}.png           # ← analyze --plot: rate(grid)별 비교 (config 1개일 때 여기)
-    ├── summary_<config>.txt / .csv            # ← analyze: 표(txt) + RAW 수치(csv, 논문용)  ※log-dir 루트에 저장
-    ├── .done_* / .failed_*                    # resume 마커
-    └── metadata.json                          # config·ctx/gen TP·PP·placement·load_tool
+    │   ── 사람이 보는 것 (폴더 열면 이것부터) ──
+    ├── REPORT.md                              # ★ 이것만 봐도 됨: 핵심표 + 지표 출처·식 + 폴더안내
+    ├── data.csv                               # 전체 메트릭 RAW 수치(논문용, analyze가 생성)
+    ├── metadata.json                          # config·ctx/gen TP·PP·placement·load_tool
+    ├── plots/                                 # analyze --plot 그림
+    │   ├── timeseries_<pt>.png                #   포인트별 시간순(배치/backlog/이실험완료)
+    │   └── grid_compare_p{pl}_d{dl}.png       #   rate(grid)별 비교 (여러 config면 results/plots/)
+    │   ── 기록용 원본 (평소 안 봐도 됨) ──
+    ├── raw/
+    │   ├── latency_throughput_<pt>.json       #   공식 benchmark_serving (TTFT/TPOT/ITL/E2EL/throughput)
+    │   ├── perside_rps_<pt>.json              #   prefill/decode 완료 카운터 스냅샷(측정 전/후)
+    │   ├── kv_transfer_<pt>.json              #   /perf_metrics (per-request KV전송시간)
+    │   ├── perside_batch_kv_backlog_<pt>.json #   워커 /metrics 집계(맨 위 _legend 자체설명)
+    │   └── timeseries_<pt>.jsonl              #   1Hz per-tick 원본(시간순)
+    └── .done_* / .failed_*                    # resume 마커
 ```
-> 파일명 = "내용"으로 자기설명적. point_id `p1024_d512_r1.0` = prefill 1024 / decode 512 / rate 1.0.
-> analyze `--plot`: **포인트별 시간순**(`timeseries_<pt>.png`) + **grid 비교**(`grid_compare_*.png`)를
-> 둘 다 생성. config 1개면 그 폴더에, 여러 개 비교면 grid는 `results/plots/`에.
+> **폴더 열면 `REPORT.md` 하나만 보면 된다** — 핵심표(꼭 보는 8개 지표) + 각 지표가 [공식/서버/계산] 중 뭔지·식 + 파일안내.
+> 전체 메트릭은 `data.csv`, 원본은 `raw/`, 그림은 `plots/`. 파일명 = 내용(point_id `p1024_d512_r1.0` = prefill1024/decode512/rate1.0).
 
 **기동 에러 추적**: 워커가 즉시 죽으면 `trtllm_<LABEL>_context_*.log` 끝부분 확인 (대부분 extra YAML 키 오타 → `ValidationError`).
 

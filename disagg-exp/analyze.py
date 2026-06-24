@@ -66,18 +66,25 @@ def parse_point_id(point_id: str) -> tuple[int, int, float]:
     return int(parts[0][1:]), int(parts[1][1:]), float(parts[2][1:])
 
 
+def _raw_dir(config_dir: Path) -> Path:
+    """원본 per-point JSON 위치. 새 레이아웃은 <config>/raw/, 옛 평면 레이아웃도 그대로 지원."""
+    r = config_dir / "raw"
+    return r if r.exists() else config_dir
+
+
 def list_points(config_dir: Path) -> list[str]:
-    """config 디렉토리의 latency_throughput_<point>.json들에서 point_id 목록 추출."""
-    if not config_dir.exists():
+    """config의 latency_throughput_<point>.json들에서 point_id 목록 추출 (raw/ 우선)."""
+    rd = _raw_dir(config_dir)
+    if not rd.exists():
         return []
-    return sorted(p.stem[len(F_BENCH) + 1:] for p in config_dir.glob(f"{F_BENCH}_*.json"))
+    return sorted(p.stem[len(F_BENCH) + 1:] for p in rd.glob(f"{F_BENCH}_*.json"))
 
 
 def load_bench(config_dir: Path, point_id: str) -> dict:
     """bench_{point_id}.json (공식 benchmark_serving --save-result)에서 집계 메트릭을 읽음.
     percentile 키는 sweep가 넘긴 --metric-percentiles(50,99) 기준(p50_*_ms / p99_*_ms).
     파일 없음/깨짐/실패면 {'n_ok':0} → 표에 NO DATA."""
-    bf = config_dir / f"{F_BENCH}_{point_id}.json"
+    bf = _raw_dir(config_dir) / f"{F_BENCH}_{point_id}.json"
     if not bf.exists():
         return {"n_ok": 0}
     try:
@@ -125,7 +132,7 @@ def _warn_pt_delta(point_id: str, bench: dict) -> None:
 def load_perf(config_dir: Path, point_id: str) -> dict:
     """perf_{point_id}.json (orchestrator /perf_metrics 스냅샷)에서 KV전송시간·블록재사용 통계 추출.
     파일 없으면(=perf 비활성) 빈 dict → 표에 'n/a'. gen kv_cache_transfer_*는 kv_cache_size>0일 때만 존재."""
-    pf = config_dir / f"{F_PERF}_{point_id}.json"
+    pf = _raw_dir(config_dir) / f"{F_PERF}_{point_id}.json"
     if not pf.exists():
         return {}
     try:
@@ -165,7 +172,7 @@ def load_prom(config_dir: Path, point_id: str, mean_pt: float | None, mean_ct: f
       (ctx_/gen_completed_requests_total — prom_scrape.py 참조)
     - per-side TPS는 공식 토큰 카운터가 없어(LEARNING_NOTES.md §병렬화·KV전송·per-side 6번) RPS × 토큰수로 파생.
     파일 없으면(=스크레이프 비활성/orchestrator 미노출) 빈 dict → 표에 'n/a'."""
-    pf = config_dir / f"{F_PROM}_{point_id}.json"
+    pf = _raw_dir(config_dir) / f"{F_PROM}_{point_id}.json"
     if not pf.exists():
         return {}
     try:
@@ -207,7 +214,7 @@ def load_batch(config_dir: Path, point_id: str) -> dict:
     """batch_<point>.json (워커 /metrics 샘플) → per-side 배치수·KV사용 (mean). 없으면 {}.
     pf_bsz=prefill 평균 배치(numContextRequests), dc_bsz=decode 평균 배치(numGenRequests),
     dc_kv_pct=decode KV풀 사용률(usedNumBlocks/maxNumBlocks)."""
-    p = config_dir / f"{F_BATCH}_{point_id}.json"
+    p = _raw_dir(config_dir) / f"{F_BATCH}_{point_id}.json"
     if not p.exists():
         return {}
     try:
@@ -319,6 +326,69 @@ def write_csv(all_stats: dict[str, dict[str, dict]], path: Path) -> None:
             ])
 
 
+# REPORT.md 핵심표 = 꼭 보는 지표만(나머지 전부는 data.csv). (표시명, stats키, 소수자리)
+_HEADLINE = [
+    ("TTFT_p50(ms)", "ttft_p50_ms", 1), ("TPOT_p50(ms)", "tpot_p50_ms", 1),
+    ("out_tok/s", "out_tok_s", 1),
+    ("prefill_rps", "prefill_rps", 2), ("decode_rps", "decode_rps", 2),
+    ("decode_batch", "dc_bsz", 1), ("backlog", "backlog", 1), ("decode_kv%", "dc_kv_pct", 1),
+]
+
+
+def _headline_md(stats_one: dict) -> str:
+    """핵심 지표만 markdown 표 1개로(에디터/GitHub서 표로 렌더)."""
+    head = "| point | " + " | ".join(n for n, _, _ in _HEADLINE) + " |"
+    sep = "|" + "---|" * (len(_HEADLINE) + 1)
+    rows = [head, sep]
+    for config in sorted(stats_one):
+        for p in sorted(stats_one[config]):
+            s = stats_one[config][p]
+            cells = []
+            for _, key, prec in _HEADLINE:
+                v = s.get(key)
+                cells.append(f"{v:.{prec}f}" if isinstance(v, (int, float)) and v == v else "n/a")
+            rows.append(f"| {p} | " + " | ".join(cells) + " |")
+    return "\n".join(rows)
+
+
+def _file_index() -> str:
+    return "\n".join([
+        "REPORT.md      이 파일 — 핵심표 + 지표뜻 + 폴더안내",
+        "data.csv       전체 수치(모든 메트릭, RAW, 논문용)",
+        "plots/         timeseries_<pt>.png(포인트별 시간순) · grid_compare_*.png(rate별 비교)",
+        "raw/           원본 JSON 전부(기록용): latency_throughput / perside_rps / kv_transfer /",
+        "               perside_batch_kv_backlog / timeseries.jsonl",
+        "metadata.json  설정(모델·ctx/gen TP·PP·placement)",
+        ".done_* .failed_*   재실행 스킵 마커",
+    ])
+
+
+def write_report(config: str, config_dir: Path, stats_one: dict) -> None:
+    """config 폴더에 자체완결 REPORT.md(핵심표+지표뜻+안내) + data.csv(전체) 작성."""
+    meta = {}
+    mp = config_dir / "metadata.json"
+    if mp.exists():
+        try:
+            meta = json.loads(mp.read_text())
+        except Exception:
+            pass
+    c, g = meta.get("context", {}), meta.get("generation", {})
+    topo = (f"{c.get('num_instances','?')}P(tp{c.get('tp','?')},pp{c.get('pp','?')})"
+            f" + {g.get('num_instances','?')}D(tp{g.get('tp','?')},pp{g.get('pp','?')})")
+    md = [
+        f"# {config} — TRT-LLM PD 분리 결과", "",
+        f"- 모델: {meta.get('model','?')}",
+        f"- 토폴로지: {topo}  ·  배치: {meta.get('placement','?')}-node  ·  KV전송: {meta.get('cache_transceiver_backend','?')}",
+        "- 부하: 공식 benchmark_serving (open-loop, Poisson). point = p{prefill}_d{decode}_r{rate}", "",
+        "## 핵심 결과", _headline_md(stats_one), "",
+        "> 전체 메트릭(p99·ITL·E2EL·tok/s·busy% 등) = `data.csv` · 시간순 그림 = `plots/timeseries_*.png` · rate별 = `plots/grid_compare_*.png`", "",
+        "## 지표 뜻 / 출처·식", "```", metric_glossary(), "```", "",
+        "## 이 폴더 안내", "```", _file_index(), "```",
+    ]
+    (config_dir / "REPORT.md").write_text("\n".join(md) + "\n")
+    write_csv(stats_one, config_dir / "data.csv")
+
+
 def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
     """[grid 포인트 1개의 시간순 동역학] timeseries_<point>.jsonl(1Hz per-tick)를 읽어
     3패널 시계열을 그 config 폴더에 저장:
@@ -328,7 +398,7 @@ def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
     (배치수는 enable_iter_perf_stats:true여야 채워짐. null이면 그 패널만 'n/a' 표시.)"""
     if not HAS_MPLOT:
         return
-    fp = config_dir / f"{F_LIVE}_{point_id}.jsonl"
+    fp = _raw_dir(config_dir) / f"{F_LIVE}_{point_id}.jsonl"
     if not fp.exists():
         return
     rows = []
@@ -391,7 +461,9 @@ def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
     ax.set_title("completions this run (slope = rps)"); ax.set_xlabel("t (s)"); ax.set_ylabel("requests")
 
     fig.tight_layout()
-    fname = config_dir / f"{F_LIVE}_{point_id}.png"
+    plots = config_dir / "plots"
+    plots.mkdir(exist_ok=True)
+    fname = plots / f"{F_LIVE}_{point_id}.png"
     fig.savefig(fname, dpi=120)
     plt.close(fig)
     print(f"  saved {fname}")
@@ -479,33 +551,24 @@ def main(args: argparse.Namespace) -> None:
         print("No data found.", file=sys.stderr)
         sys.exit(1)
 
-    txt = format_tables(all_stats)
-    gloss = metric_glossary()
-    print(txt)
-    print("\n" + gloss)
-
-    # 터미널뿐 아니라 파일로도 저장 (스크롤로 날아가지 않게 + 논문용 RAW CSV). glossary도 같이.
-    tag = "_".join(sorted(all_stats))
-    summary_txt = log_dir / f"summary_{tag}.txt"
-    summary_csv = log_dir / f"summary_{tag}.csv"
-    summary_txt.write_text(txt + "\n\n" + gloss + "\n")
-    write_csv(all_stats, summary_csv)
-    print(f"\n[analyze] 표 저장 → {summary_txt}")
-    print(f"[analyze] CSV 저장 → {summary_csv}")
+    # 터미널엔 전체 표 + glossary (즉시 확인용). 파일은 config 폴더별로 깔끔히.
+    print(format_tables(all_stats))
+    print("\n" + metric_glossary())
 
     if args.plot:
-        # ① 포인트별 시간순 동역학 → 각 config 폴더 (results/<config>/timeseries_<pt>.png)
+        # ① 포인트별 시간순 → 각 config의 plots/ (results/<config>/plots/timeseries_<pt>.png)
         for config in all_stats:
-            cdir = log_dir / config
             for point_id in all_stats[config]:
-                plot_timeseries(config, point_id, cdir)
-        # ② grid 비교(vs rate) → config 1개면 그 폴더, 여러 개면 results/plots/ (교차 비교)
-        if len(all_stats) == 1:
-            comp_dir = log_dir / next(iter(all_stats))
-        else:
-            comp_dir = log_dir / "plots"
-            comp_dir.mkdir(exist_ok=True)
+                plot_timeseries(config, point_id, log_dir / config)
+        # ② grid 비교(vs rate) → config 1개면 그 config의 plots/, 여러 개면 results/plots/(교차)
+        comp_dir = (log_dir / next(iter(all_stats)) / "plots") if len(all_stats) == 1 else (log_dir / "plots")
+        comp_dir.mkdir(parents=True, exist_ok=True)
         plot_comparison(all_stats, comp_dir)
+
+    # 각 config 폴더에 자체완결 REPORT.md(핵심표+지표뜻+안내) + data.csv(전체) → 폴더만 열면 다 봄
+    for config in all_stats:
+        write_report(config, log_dir / config, {config: all_stats[config]})
+        print(f"[analyze] {config} → results/{config}/REPORT.md  (+ data.csv · plots/ · raw/)")
 
 
 if __name__ == "__main__":
