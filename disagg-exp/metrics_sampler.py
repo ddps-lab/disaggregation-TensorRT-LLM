@@ -89,19 +89,20 @@ class BatchSampler:
     def _print_live(self) -> None:
         bl = self._backlog[-1] if self._backlog else None
         secs = self._tick * self._interval
-        print(f"  [live +{secs:.0f}s] ctx_done={self._last_ctx} gen_done={self._last_gen} "
-              f"backlog={bl} | pf_bsz={self._last_batch('prefill')} dc_bsz={self._last_batch('decode')}",
+        print(f"  [live +{secs:.0f}s] prefill_done={self._last_ctx} decode_done={self._last_gen} "
+              f"backlog={bl} | prefill_batch={self._last_batch('prefill')} decode_batch={self._last_batch('decode')}",
               file=sys.stderr, flush=True)
 
     async def _loop(self) -> None:
         while not self._stop.is_set():
             await asyncio.gather(*[self._poll_worker(s, u) for s, u in self._endpoints])
             await self._poll_backlog()
-            self.trace.append({                       # 라이브 기록(매 tick) — 나중에 live_<point>.jsonl
+            self.trace.append({                       # 라이브 기록(매 tick) — timeseries_<point>.jsonl
                 "t": round(self._tick * self._interval, 1),
-                "ctx_done": self._last_ctx, "gen_done": self._last_gen,
-                "backlog": (self._backlog[-1] if self._backlog else None),
-                "pf_bsz": self._last_batch("prefill"), "dc_bsz": self._last_batch("decode"),
+                "prefill_done": self._last_ctx, "decode_done": self._last_gen,   # 누적 완료수(ctx/gen)
+                "backlog": (self._backlog[-1] if self._backlog else None),       # prefill끝·decode대기 수
+                "prefill_batch": self._last_batch("prefill"),                    # 그 순간 동시 배치수
+                "decode_batch": self._last_batch("decode"),
             })
             if self._live and self._tick % self._live_every == 0:
                 self._print_live()
@@ -121,7 +122,19 @@ class BatchSampler:
         return self._aggregate()
 
     def _aggregate(self) -> dict:
-        out: dict = {}
+        # _legend: 이 파일의 키가 뭔지 자체 설명 ({side}=prefill|decode). 출처/식까지.
+        out: dict = {"_legend": {
+            "출처": "batch·kv = 워커 /metrics (inflightBatchingStats/kvCacheStats), "
+                    "backlog = orchestrator ctx/gen_completed 카운터 차. 모두 1Hz 샘플.",
+            "{side}_batch_mean": "동시 배치수 평균 (idle 0 포함 = 점유율 관점)",
+            "{side}_batch_mean_active": "동시 배치수 평균 (idle 0 제외 = 처리 중일 때만). 표 prefill_batch/decode_batch가 이것",
+            "{side}_batch_max": "관측된 최대 동시 배치수",
+            "{side}_active_frac": "batch>0(바쁜) 샘플 비율 0~1 (표 *_busy% = ×100)",
+            "{side}_kv_used_frac_mean/max": "KV풀 사용률 usedNumBlocks/maxNumBlocks 평균/최대 (표 decode_kv% = ×100)",
+            "{side}_n_samples": "그 측면 1Hz 샘플 개수",
+            "backlog_mean/max": "(ctx_completed - gen_completed) 평균/최대 = prefill 끝났는데 decode 아직 안 끝난 요청수",
+            "backlog_n_samples": "backlog 샘플 개수",
+        }}
         for side, rows in self._samples.items():
             batches = [r["batch"] for r in rows if isinstance(r["batch"], (int, float))]
             fracs = [r["used"] / r["maxb"] for r in rows

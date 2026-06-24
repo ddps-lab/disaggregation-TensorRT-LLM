@@ -252,16 +252,37 @@ _TABLE_GROUPS = [
         ("out_tok/s", "out_tok_s", 10, 1),
         ("kv_p50", "kv_transfer_p50_ms", 8, 2), ("kv_p99", "kv_transfer_p99_ms", 8, 2),
     ]),
-    ("③ per-side 완료율·토큰 (prefill vs decode)", [
-        ("pf_rps", "prefill_rps", 8, 2), ("dc_rps", "decode_rps", 8, 2),
-        ("pf_tps", "prefill_tps", 8, 0), ("dc_tps", "decode_tps", 8, 0),
+    ("③ per-side 완료율·토큰 (prefill vs decode) — [계산]", [
+        ("prefill_rps", "prefill_rps", 11, 2), ("decode_rps", "decode_rps", 11, 2),
+        ("prefill_tok/s", "prefill_tps", 13, 0), ("decode_tok/s", "decode_tps", 13, 0),
     ]),
-    ("④ per-side 배치·점유·backlog (배치=처리중 평균, act%=바쁜시간, backlog=쌓인수)", [
-        ("pf_bsz", "pf_bsz", 7, 2), ("dc_bsz", "dc_bsz", 7, 2),
-        ("pf_act%", "pf_act", 8, 1), ("dc_act%", "dc_act", 8, 1),
-        ("dc_kv%", "dc_kv_pct", 7, 1), ("backlog", "backlog", 8, 1),
+    ("④ per-side 배치·KV·backlog (batch=동시처리 평균, busy%=바쁜시간, backlog=쌓인수)", [
+        ("prefill_batch", "pf_bsz", 13, 2), ("decode_batch", "dc_bsz", 13, 2),
+        ("prefill_busy%", "pf_act", 13, 1), ("decode_busy%", "dc_act", 13, 1),
+        ("decode_kv%", "dc_kv_pct", 10, 1), ("backlog", "backlog", 8, 1),
     ]),
 ]
+
+
+def metric_glossary() -> str:
+    """각 지표 = 어디서 왔나. [공식]=benchmark_serving, [서버]=워커/orchestrator raw, [계산]=우리 코드 식."""
+    return "\n".join([
+        "── 지표 출처·식  ([공식]=benchmark_serving / [서버]=raw 노출값 / [계산]=우리 코드) ──",
+        "n_ok, fail%      [공식] 완료 요청수 / 실패율(%)",
+        "ttft,tpot,itl,e2el  [공식] per-request 측정 분포의 p50/p99 (ms). 우리 계산 아님",
+        "out_tok/s        [공식] 생성토큰 합 / 측정시간",
+        "kv_p50, kv_p99   [서버] /perf_metrics 의 (kv_cache_transfer_end - start)×1000 [ms] 분포 p50/p99",
+        "prefill_rps      [계산] (측정후 - 측정전, ctx_completed_requests_total) / window_s",
+        "decode_rps       [계산] (측정후 - 측정전, gen_completed_requests_total) / window_s",
+        "prefill_tok/s    [계산·근사] prefill_rps × 입력길이(ISL).  ※토큰 카운터가 없어 곱셈 근사",
+        "decode_tok/s     [계산·근사] decode_rps  × 출력길이(OSL).  ※동상",
+        "prefill_batch    [서버] 워커 /metrics inflightBatchingStats.numContextRequests, 1Hz 샘플 평균(idle 0 제외)",
+        "decode_batch     [서버] 워커 /metrics inflightBatchingStats.numGenRequests,    1Hz 샘플 평균(idle 0 제외)",
+        "prefill_busy%    [계산] prefill_batch>0 인 샘플 비율 × 100 (= 바쁜 시간 비율)",
+        "decode_busy%     [계산] decode_batch>0 인 샘플 비율 × 100",
+        "decode_kv%       [서버] 워커 /metrics kvCacheStats.usedNumBlocks / maxNumBlocks × 100, 1Hz 평균",
+        "backlog          [계산] (ctx_completed - gen_completed) 1Hz 평균 = 'prefill 끝났는데 decode 아직 안 끝난 요청수'",
+    ])
 
 
 def format_tables(all_stats: dict[str, dict[str, dict]]) -> str:
@@ -321,9 +342,13 @@ def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
     if not rows:
         return
 
-    def xy(key):  # 값이 None 아닌 (t, value)만
-        xs = [r.get("t") for r in rows if r.get(key) is not None]
-        ys = [r.get(key) for r in rows if r.get(key) is not None]
+    def xy(*keys):  # 값이 None 아닌 첫 키의 (t, value). 신/구 키 모두 대응(구 trace 호환)
+        xs, ys = [], []
+        for r in rows:
+            v = next((r[k] for k in keys if r.get(k) is not None), None)
+            if v is not None:
+                xs.append(r.get("t"))
+                ys.append(v)
         return xs, ys
 
     # 라벨은 영어로 (컨테이너 matplotlib에 한글 폰트 없어 □ 깨짐 + 논문용 적합).
@@ -332,8 +357,8 @@ def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
 
     # ① concurrent batch
     ax = axes[0]
-    pf_x, pf_y = xy("pf_bsz")
-    dc_x, dc_y = xy("dc_bsz")
+    pf_x, pf_y = xy("prefill_batch", "pf_bsz")
+    dc_x, dc_y = xy("decode_batch", "dc_bsz")
     if pf_x:
         ax.plot(pf_x, pf_y, marker=".", label="prefill batch")
     if dc_x:
@@ -355,8 +380,8 @@ def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
 
     # ③ cumulative completions
     ax = axes[2]
-    cx, cy = xy("ctx_done")
-    gx, gy = xy("gen_done")
+    cx, cy = xy("prefill_done", "ctx_done")
+    gx, gy = xy("decode_done", "gen_done")
     if cx:
         ax.plot(cx, cy, marker=".", label="ctx_done (prefill, cumulative)")
     if gx:
@@ -455,13 +480,15 @@ def main(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     txt = format_tables(all_stats)
+    gloss = metric_glossary()
     print(txt)
+    print("\n" + gloss)
 
-    # 터미널뿐 아니라 파일로도 저장 (스크롤로 날아가지 않게 + 논문용 RAW CSV).
+    # 터미널뿐 아니라 파일로도 저장 (스크롤로 날아가지 않게 + 논문용 RAW CSV). glossary도 같이.
     tag = "_".join(sorted(all_stats))
     summary_txt = log_dir / f"summary_{tag}.txt"
     summary_csv = log_dir / f"summary_{tag}.csv"
-    summary_txt.write_text(txt + "\n")
+    summary_txt.write_text(txt + "\n\n" + gloss + "\n")
     write_csv(all_stats, summary_csv)
     print(f"\n[analyze] 표 저장 → {summary_txt}")
     print(f"[analyze] CSV 저장 → {summary_csv}")
