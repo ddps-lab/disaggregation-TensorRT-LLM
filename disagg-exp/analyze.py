@@ -241,6 +241,9 @@ def load_prom(config_dir: Path, point_id: str, mean_pt: float | None, mean_ct: f
         out["decode_rps"] = dc_rps
         if mean_ct:
             out["decode_tps"] = dc_rps * mean_ct
+    # prefill이 decode보다 초당 몇 개 더 끝내나 = backlog가 쌓이는 속도(양수=decode가 못 따라감).
+    if pf_rps is not None and dc_rps is not None:
+        out["accum_rps"] = pf_rps - dc_rps
     return out
 
 
@@ -281,27 +284,36 @@ def load_batch(config_dir: Path, point_id: str) -> dict:
     return out
 
 
-# 표/CSV 공통 컬럼 스펙: (표시이름, stats키, 너비, 소수자리). 카테고리별 4개 서브-표.
+# 표/CSV 공통 컬럼 스펙: (표시이름, stats키, 최소너비, 소수자리).
+# 이름은 풀네임 = "무엇 + 집계방식(median/mean/p99) + 단위"가 이름만 봐도 보이게.
+# 너비는 이름보다 짧으면 format_tables가 자동으로 이름 길이에 맞춰 늘림.
 _TABLE_GROUPS = [
-    ("① 지연 단계분해 (초, perf_metrics — 한 요청 시간이 어디서 쓰이나; e2e≈prefill+kv전송+decode)", [
-        ("prefill_s", "prefill_s", 10, 3), ("kv_transfer_s", "kv_transfer_s", 14, 3),
-        ("decode_s", "decode_stage_s", 10, 3), ("e2e_s", "e2e_stage_s", 9, 3),
+    ("① 한 요청 시간 단계분해 (perf_metrics, 요청별 median, 초) — e2e ≈ prefill + kv전송 + decode", [
+        ("prefill_time_median_s", "prefill_s", 0, 3),
+        ("kv_transfer_time_median_s", "kv_transfer_s", 0, 3),
+        ("decode_time_median_s", "decode_stage_s", 0, 3),
+        ("e2e_time_median_s", "e2e_stage_s", 0, 3),
     ]),
-    ("② 지연 공식측정 (초, benchmark_serving — 클라이언트 SLO. TTFT=첫토큰·TPOT=토큰당·E2EL=요청끝)", [
-        ("n_ok", "n_ok", 5, 0), ("fail%", "fail_pct", 6, 1),
-        ("ttft_p50_s", "ttft_p50_s", 11, 3), ("ttft_p99_s", "ttft_p99_s", 11, 3),
-        ("tpot_p50_s", "tpot_p50_s", 11, 3), ("e2el_p99_s", "e2el_p99_s", 11, 2),
+    ("② 공식 지연 (benchmark_serving, 클라이언트 측정, 초) — TTFT=첫토큰까지·TPOT=토큰당·E2E=요청끝까지", [
+        ("requests_ok", "n_ok", 0, 0), ("fail_pct", "fail_pct", 0, 1),
+        ("ttft_median_s", "ttft_p50_s", 0, 3), ("ttft_p99_s", "ttft_p99_s", 0, 3),
+        ("tpot_median_s", "tpot_p50_s", 0, 4), ("e2e_client_p99_s", "e2el_p99_s", 0, 2),
     ]),
-    ("③ 처리량 throughput", [
-        ("out_tok/s", "out_tok_s", 10, 1),
+    ("③ 처리량", [
+        ("output_tokens_per_sec", "out_tok_s", 0, 1),
     ]),
-    ("④ per-side 완료율·토큰 (prefill vs decode) — [계산]", [
-        ("prefill_rps", "prefill_rps", 11, 2), ("decode_rps", "decode_rps", 11, 2),
-        ("prefill_tok/s", "prefill_tps", 13, 0), ("decode_tok/s", "decode_tps", 13, 0),
+    ("④ prefill vs decode 완료 속도·차이 (측정창 평균, [계산]) — 차이>0이면 decode가 못 따라가 backlog 쌓임", [
+        ("prefill_completed_reqs_per_sec", "prefill_rps", 0, 3),
+        ("decode_completed_reqs_per_sec", "decode_rps", 0, 3),
+        ("prefill_minus_decode_per_sec", "accum_rps", 0, 3),
+        ("prefill_tokens_per_sec_approx", "prefill_tps", 0, 0),
+        ("decode_tokens_per_sec_approx", "decode_tps", 0, 0),
     ]),
-    ("⑤ per-side 배치·KV·backlog (batch=동시처리수, backlog=대기수)", [
-        ("prefill_batch", "pf_bsz", 13, 2), ("decode_batch", "dc_bsz", 13, 2),
-        ("decode_kv%", "dc_kv_pct", 10, 1), ("backlog", "backlog", 8, 1),
+    ("⑤ prefill vs decode 동시처리·KV·대기 (1Hz 샘플 mean)", [
+        ("prefill_concurrent_reqs_mean", "pf_bsz", 0, 2),
+        ("decode_concurrent_reqs_mean", "dc_bsz", 0, 2),
+        ("decode_kvpool_used_pct_mean", "dc_kv_pct", 0, 1),
+        ("backlog_waiting_reqs_mean", "backlog", 0, 1),
     ]),
 ]
 
@@ -309,28 +321,30 @@ _TABLE_GROUPS = [
 def metric_glossary() -> str:
     """각 지표 = 어디서 왔나. [공식]=benchmark_serving, [서버]=워커/orchestrator raw, [계산]=우리 코드 식."""
     return "\n".join([
-        "── 지표 출처·식  ([공식]=benchmark_serving / [서버]=perf_metrics·/metrics / [계산]=우리 코드).  시간=초 ──",
-        "[단계분해 — perf_metrics, 한 요청 시간을 단계로 쪼갬, 요청별 중앙값(p50)]",
-        "prefill_s        [서버] ctx 첫토큰 − ctx 도착  (prefill 단계)",
-        "kv_transfer_s    [서버] kv_cache_transfer_end − start  (inter-node KV전송 단계)",
-        "decode_s         [서버] gen 마지막토큰 − gen 첫토큰  (decode 단계, 첫토큰 이후)",
-        "e2e_s            [서버] gen 마지막토큰 − disagg 도착  (요청 전체) ≈ prefill + kv_transfer + decode",
-        "   ※ warmup(8토큰, decode≤1s)은 걸러 측정 요청만 집계",
-        "[공식측정 — benchmark_serving, 클라이언트 SLO]",
-        "n_ok, fail%      [공식] 완료 요청수 / 실패율(%)",
-        "ttft_p50/99_s    [공식] 첫 토큰까지(prefill+전송+첫decode 다 포함)",
-        "tpot_p50_s       [공식] 토큰당 시간(첫토큰 제외).  ※E2E ≈ ttft + tpot×출력토큰수",
-        "e2el_p99_s       [공식] 요청 끝까지(클라이언트 측정)",
-        "out_tok/s        [공식] 생성토큰 합 / 측정시간",
-        "[per-side — 측정 윈도우/워커]",
-        "prefill_rps      [계산] (측정후 − 측정전, ctx_completed_requests_total) / window_s",
-        "decode_rps       [계산] (측정후 − 측정전, gen_completed_requests_total) / window_s",
-        "prefill_tok/s    [계산·근사] prefill_rps × 입력길이(ISL).  ※토큰 카운터 없어 곱셈 근사",
-        "decode_tok/s     [계산·근사] decode_rps  × 출력길이(OSL)",
-        "prefill_batch    [서버] 워커 /metrics numContextRequests, 1Hz 샘플 평균(처리중일 때)",
-        "decode_batch     [서버] 워커 /metrics numGenRequests,    1Hz 샘플 평균(처리중일 때)",
-        "decode_kv%       [서버] 워커 /metrics usedNumBlocks / maxNumBlocks × 100, 1Hz 평균",
-        "backlog          [계산] (ctx_completed − gen_completed) 1Hz 평균 = 'prefill 끝났는데 decode 대기 중인 요청수'",
+        "── 지표 = 무엇 / 출처 / 식  ([공식]=benchmark_serving · [서버]=perf_metrics·워커/metrics · [계산]=우리 코드). 시간=초 ──",
+        "[① 한 요청 시간 단계분해 — perf_metrics, 요청별 median]",
+        "prefill_time_median_s         [서버] ctx 첫토큰 − ctx 도착 (prefill 단계)",
+        "kv_transfer_time_median_s     [서버] kv_cache_transfer_end − start (inter-node KV전송 단계)",
+        "decode_time_median_s          [서버] gen 마지막토큰 − gen 첫토큰 (decode 단계, 첫토큰 이후)",
+        "e2e_time_median_s             [서버] gen 마지막토큰 − disagg 도착 (요청 전체) ≈ 위 셋의 합",
+        "   ※ warmup(8토큰, decode≤1s) 제외하고 측정 요청만 집계",
+        "[② 공식 지연 — benchmark_serving, 클라이언트가 측정한 SLO]",
+        "requests_ok / fail_pct        [공식] 완료 요청수 / 실패율(%)",
+        "ttft_median_s / ttft_p99_s    [공식] 첫 토큰까지 (median / 99퍼센타일)",
+        "tpot_median_s                 [공식] 토큰당 시간(첫토큰 제외, median). ※E2E ≈ ttft + tpot×출력토큰수",
+        "e2e_client_p99_s              [공식] 요청 끝까지 (99퍼센타일)",
+        "output_tokens_per_sec         [공식] 생성토큰 합 / 측정시간",
+        "[③ prefill vs decode 완료 속도·차이 — orchestrator 완료 카운터, 측정창 평균]",
+        "prefill_completed_reqs_per_sec [계산] (측정후−측정전 ctx_completed)/window = prefill이 초당 끝낸 요청수",
+        "decode_completed_reqs_per_sec  [계산] (측정후−측정전 gen_completed)/window = decode가 초당 끝낸 요청수",
+        "prefill_minus_decode_per_sec   [계산] 위 둘의 차이 = backlog 쌓이는 속도 (양수=decode가 못 따라감)",
+        "prefill_tokens_per_sec_approx  [계산·근사] prefill_completed × 입력길이(ISL). ※토큰 카운터 없어 곱셈 근사",
+        "decode_tokens_per_sec_approx   [계산·근사] decode_completed × 출력길이(OSL)",
+        "[④ 동시처리·KV·대기 — 워커 /metrics, 1Hz 샘플 평균(mean)]",
+        "prefill_concurrent_reqs_mean   [서버] prefill 워커가 동시에 처리 중인 요청수(numContextRequests) 평균",
+        "decode_concurrent_reqs_mean    [서버] decode 워커 동시 처리 요청수(numGenRequests) 평균",
+        "decode_kvpool_used_pct_mean    [서버] decode KV풀 사용률(usedNumBlocks/maxNumBlocks×100) 평균",
+        "backlog_waiting_reqs_mean      [계산] (ctx_completed−gen_completed) 평균 = prefill 끝났는데 decode 대기 중인 요청수",
     ])
 
 
@@ -339,13 +353,15 @@ def format_tables(all_stats: dict[str, dict[str, dict]]) -> str:
     keys = [(c, p) for c in sorted(all_stats) for p in sorted(all_stats[c])]
     lines: list[str] = []
     for title, cols in _TABLE_GROUPS:
-        hdr = f"{'config':<8} {'point':<24}" + "".join(f" {n:>{w}}" for n, _, w, _ in cols)
+        # 컬럼 너비 = max(스펙 너비, 풀네임 길이) → 긴 이름도 안 깨지고 정렬됨.
+        widths = [max(w, len(n)) for n, _, w, _ in cols]
+        hdr = f"{'config':<8} {'point':<24}" + "".join(f" {n:>{cw}}" for (n, _, _, _), cw in zip(cols, widths))
         lines += [f"\n── {title} ──", hdr, "-" * len(hdr)]
         for c, p in keys:
             s = all_stats[c][p]
             row = f"{c:<8} {p:<24}"
-            for _, key, w, prec in cols:
-                row += f" {_fmt(s.get(key), w, prec)}"
+            for (_, key, _, prec), cw in zip(cols, widths):
+                row += f" {_fmt(s.get(key), cw, prec)}"
             lines.append(row)
     return "\n".join(lines)
 
@@ -371,10 +387,14 @@ def write_csv(all_stats: dict[str, dict[str, dict]], path: Path) -> None:
 # REPORT.md 핵심표 = 꼭 보는 지표만(나머지 전부는 data.csv). (표시명, stats키, 소수자리)
 # 단계분해(초) 중심 — 한 요청 시간이 prefill/KV전송/decode 어디에 쓰이나 + 처리량·decode배치·backlog.
 _HEADLINE = [
-    ("prefill_s", "prefill_s", 3), ("kv_transfer_s", "kv_transfer_s", 3),
-    ("decode_s", "decode_stage_s", 3), ("e2e_s", "e2e_stage_s", 3),
-    ("out_tok/s", "out_tok_s", 1),
-    ("decode_batch", "dc_bsz", 1), ("backlog", "backlog", 1), ("decode_kv%", "dc_kv_pct", 1),
+    ("prefill_time_median_s", "prefill_s", 3),
+    ("kv_transfer_time_median_s", "kv_transfer_s", 3),
+    ("decode_time_median_s", "decode_stage_s", 3),
+    ("e2e_time_median_s", "e2e_stage_s", 3),
+    ("output_tokens_per_sec", "out_tok_s", 1),
+    ("decode_concurrent_reqs_mean", "dc_bsz", 1),
+    ("backlog_waiting_reqs_mean", "backlog", 1),
+    ("prefill_minus_decode_per_sec", "accum_rps", 3),
 ]
 
 
