@@ -54,22 +54,44 @@ if ! command -v s5cmd &>/dev/null; then
     || echo "[setup] WARN: s5cmd 설치 실패 — S3 sync 비활성"
 fi
 
-# ── 4. chrony (cross-node 시계동기 baseline — inter-node 측정에 필수) ─────────
-if command -v chronyc &>/dev/null; then
-    chronyc tracking > "$LOG_DIR/clock_baseline_$(hostname).txt" 2>&1 || true
-    echo "[setup] chrony baseline → $LOG_DIR/clock_baseline_$(hostname).txt"
-else
-    echo "[setup] WARN: chronyc 없음. 호스트에 'apt install chrony' 권장(inter-node 타임스탬프 정렬용)."
+# ── 4. chrony (cross-node 시계동기 baseline — inter-node 타임스탬프 정렬 기록용) ──
+# 컨테이너는 호스트 커널 시계를 공유한다(안에서 시계 변경 불가). 그래서 여기선 "현재 얼마나
+# 잘 맞는지"를 baseline으로만 기록한다. AWS는 Amazon Time Sync(169.254.169.123)로 호스트가 이미
+# 동기화됨. 우선순위: chronyc tracking(호스트 chronyd 접근 시) → chronyd -Q(시계 안 건드리고 NTP
+# offset 1회 측정, 컨테이너서 동작) → date. 어느 쪽이든 baseline 파일은 항상 채워진다.
+if ! command -v chronyc &>/dev/null && ! command -v chronyd &>/dev/null; then
+    echo "[setup] installing chrony (clock baseline) ..."
+    $SUDO apt-get update -qq 2>/dev/null || true   # ifstat에서 안 돌았을 수 있어 한 번 더(idempotent)
+    $SUDO apt-get install -y -q chrony 2>/dev/null || echo "[setup] WARN: apt install chrony 실패 — date 기반 baseline으로 폴백"
 fi
+CLOCK_BASE="$LOG_DIR/clock_baseline_$(hostname).txt"
+# chronyd는 /usr/sbin에 설치돼 root PATH에 없을 수 있어 명시 경로도 확인.
+CHRONYD_BIN="$(command -v chronyd 2>/dev/null || true)"
+[[ -z "$CHRONYD_BIN" && -x /usr/sbin/chronyd ]] && CHRONYD_BIN=/usr/sbin/chronyd
+{
+    echo "# clock baseline @ $(date -u +%FT%TZ) host=$(hostname)"
+    if command -v chronyc &>/dev/null && chronyc tracking 2>/dev/null; then
+        echo "# (source: chronyc tracking — 호스트 chronyd 접근됨)"
+    elif [[ -n "$CHRONYD_BIN" ]]; then
+        echo "# (source: chronyd -Q one-shot NTP query → Amazon Time Sync; 시계는 안 건드림)"
+        timeout 20 $SUDO "$CHRONYD_BIN" -Q 'server 169.254.169.123 iburst' 2>&1 \
+          || timeout 20 "$CHRONYD_BIN" -Q 'server pool.ntp.org iburst' 2>&1 \
+          || echo "WARN: chronyd -Q 실패 — date만 기록"
+    else
+        echo "WARN: chrony 미설치 — date만 기록(호스트가 Amazon Time Sync로 동기화됨을 전제)"
+    fi
+    echo "# date -u(기록완료): $(date -u +%FT%T.%NZ)"
+} > "$CLOCK_BASE" 2>&1
+echo "[setup] clock baseline → $CLOCK_BASE"
 
-# ── 5. DCGM exporter (best-effort; 보통 호스트 :9400) ────────────────────────
-if ! curl -sf "http://localhost:9400/metrics" | grep -q DCGM_FI 2>/dev/null; then
+# ── 5. DCGM exporter (선택 — nvidia-smi dmon이 GPU util/mem-bw/power/clk/PCIe를 이미 1Hz로 커버) ──
+# DCGM은 보강용(SM_OCCUPANCY/DRAM_ACTIVE 등). 보통 호스트나 별도 dcgm-exporter 컨테이너가 :9400로 노출.
+# 컨테이너 안에 바이너리가 있으면 best-effort로 띄워봄(대개 없음 → 정상, §6에서 조용히 건너뜀).
+if ! curl -sf "http://localhost:9400/metrics" 2>/dev/null | grep -q DCGM_FI; then
     if command -v dcgm-exporter &>/dev/null; then
         nohup dcgm-exporter -f /etc/dcgm-exporter/default-counters.csv \
             -a ":9400" >> "$LOG_DIR/dcgm_exporter.log" 2>&1 &
         echo "[setup] started dcgm-exporter (pid $!)"
-    else
-        echo "[setup] WARN: dcgm-exporter 없음. DCGM 메트릭 부재(호스트에서 기동 권장)."
     fi
 fi
 
@@ -109,16 +131,21 @@ else
     echo "[setup] WARN: ifstat 없음 — NIC 메트릭 부재."
 fi
 
-# DCGM scrape loop (PID 파일로 재실행 시 안전하게 kill)
-(while true; do
-    curl -sf "http://localhost:9400/metrics" \
-        | grep -E "DCGM_FI_DEV_(FB_USED|GPU_UTIL|SM_OCCUPANCY|POWER_USAGE|DRAM_ACTIVE|MEM_COPY_UTILIZATION)" \
-        >> "$LOG_DIR/dcgm.log" 2>/dev/null
-    echo "---" >> "$LOG_DIR/dcgm.log"
-    sleep 2
-done) &
-echo $! > "$PIDFILE_DCGM"
-echo "[setup] dcgm scrape loop pid=$(cat "$PIDFILE_DCGM")"
+# DCGM scrape loop — :9400가 실제로 살아있을 때만. 없으면 건너뜀(없는데 도는 빈 루프 방지;
+# 핵심 GPU 메트릭은 위 nvidia-smi dmon이 이미 기록). PID 파일로 재실행 시 안전하게 kill.
+if curl -sf "http://localhost:9400/metrics" 2>/dev/null | grep -q DCGM_FI; then
+    (while true; do
+        curl -sf "http://localhost:9400/metrics" \
+            | grep -E "DCGM_FI_DEV_(FB_USED|GPU_UTIL|SM_OCCUPANCY|POWER_USAGE|DRAM_ACTIVE|MEM_COPY_UTILIZATION)" \
+            >> "$LOG_DIR/dcgm.log" 2>/dev/null
+        echo "---" >> "$LOG_DIR/dcgm.log"
+        sleep 2
+    done) &
+    echo $! > "$PIDFILE_DCGM"
+    echo "[setup] dcgm scrape loop pid=$(cat "$PIDFILE_DCGM") (:9400 live)"
+else
+    echo "[setup] DCGM :9400 없음 → scrape 건너뜀 (선택사항; nvidia-smi dmon이 util/mem-bw/power/clk/PCIe 커버)"
+fi
 
 # ── 7. validation (TRT-LLM 버전 핀 확인) ─────────────────────────────────────
 $PY -c "
