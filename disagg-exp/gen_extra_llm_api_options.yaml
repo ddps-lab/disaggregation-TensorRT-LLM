@@ -19,6 +19,10 @@ max_num_tokens: 16384        # decode는 iter당 ~batch개 토큰 → max_num_to
 # per-request perf 메트릭(KV전송시간 등) 수집 → orchestrator /perf_metrics로 노출 (analyze가 사용)
 return_perf_metrics: true
 perf_metrics_max_requests: 1000    # 워커 perf 버퍼 (>= 측정 N). 0이면 비활성
+# iteration stats 수집 → 워커 /metrics(get_iteration_stats)로 노출. 없으면 /metrics가 빈 []라
+#   per-side 배치수(inflightBatchingStats.numGenRequests)·KV풀(kvCacheStats)을 못 잡음(py_executor.py:537).
+#   metrics_sampler가 이걸 폴링해 dc_bsz·dc_kv%를 채움. (소량 오버헤드, return_perf_metrics와 같은 계측용.)
+enable_iter_perf_stats: true
 
 kv_cache_config:
   free_gpu_memory_fraction: 0.85   # ctx와 통일

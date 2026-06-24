@@ -11,6 +11,7 @@ per-side(prefill/decode) RPS·TPS는 `prom_<point>.json`, KV전송시간은 `per
 """
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -230,42 +231,62 @@ def load_batch(config_dir: Path, point_id: str) -> dict:
     return out
 
 
-def print_table(all_stats: dict[str, dict[str, dict]]) -> None:
-    """한 줄에 다 박지 않고 카테고리별 4개 서브-표로 출력. 모든 표의 행 키 = (config, point).
-    컬럼 스펙: (표시이름, stats키, 너비, 소수자리)."""
-    groups = [
-        ("① 지연 latency (ms)", [
-            ("n_ok", "n_ok", 5, 0), ("fail%", "fail_pct", 6, 1),
-            ("ttft_p50", "ttft_p50_ms", 9, 1), ("ttft_p99", "ttft_p99_ms", 9, 1),
-            ("tpot_p50", "tpot_p50_ms", 9, 2), ("tpot_p99", "tpot_p99_ms", 9, 2),
-            ("itl_p99", "itl_p99_ms", 8, 2), ("e2el_p99", "e2el_p99_ms", 9, 1),
-        ]),
-        ("② 처리량 throughput + KV전송(ms)", [
-            ("out_tok/s", "out_tok_s", 10, 1),
-            ("kv_p50", "kv_transfer_p50_ms", 8, 2), ("kv_p99", "kv_transfer_p99_ms", 8, 2),
-        ]),
-        ("③ per-side 완료율·토큰 (prefill vs decode)", [
-            ("pf_rps", "prefill_rps", 8, 2), ("dc_rps", "decode_rps", 8, 2),
-            ("pf_tps", "prefill_tps", 8, 0), ("dc_tps", "decode_tps", 8, 0),
-        ]),
-        ("④ per-side 배치·점유·backlog (배치=처리중 평균, act%=바쁜시간, backlog=쌓인수)", [
-            ("pf_bsz", "pf_bsz", 7, 2), ("dc_bsz", "dc_bsz", 7, 2),
-            ("pf_act%", "pf_act", 8, 1), ("dc_act%", "dc_act", 8, 1),
-            ("dc_kv%", "dc_kv_pct", 7, 1), ("backlog", "backlog", 8, 1),
-        ]),
-    ]
+# 표/CSV 공통 컬럼 스펙: (표시이름, stats키, 너비, 소수자리). 카테고리별 4개 서브-표.
+_TABLE_GROUPS = [
+    ("① 지연 latency (ms)", [
+        ("n_ok", "n_ok", 5, 0), ("fail%", "fail_pct", 6, 1),
+        ("ttft_p50", "ttft_p50_ms", 9, 1), ("ttft_p99", "ttft_p99_ms", 9, 1),
+        ("tpot_p50", "tpot_p50_ms", 9, 2), ("tpot_p99", "tpot_p99_ms", 9, 2),
+        ("itl_p99", "itl_p99_ms", 8, 2), ("e2el_p99", "e2el_p99_ms", 9, 1),
+    ]),
+    ("② 처리량 throughput + KV전송(ms)", [
+        ("out_tok/s", "out_tok_s", 10, 1),
+        ("kv_p50", "kv_transfer_p50_ms", 8, 2), ("kv_p99", "kv_transfer_p99_ms", 8, 2),
+    ]),
+    ("③ per-side 완료율·토큰 (prefill vs decode)", [
+        ("pf_rps", "prefill_rps", 8, 2), ("dc_rps", "decode_rps", 8, 2),
+        ("pf_tps", "prefill_tps", 8, 0), ("dc_tps", "decode_tps", 8, 0),
+    ]),
+    ("④ per-side 배치·점유·backlog (배치=처리중 평균, act%=바쁜시간, backlog=쌓인수)", [
+        ("pf_bsz", "pf_bsz", 7, 2), ("dc_bsz", "dc_bsz", 7, 2),
+        ("pf_act%", "pf_act", 8, 1), ("dc_act%", "dc_act", 8, 1),
+        ("dc_kv%", "dc_kv_pct", 7, 1), ("backlog", "backlog", 8, 1),
+    ]),
+]
+
+
+def format_tables(all_stats: dict[str, dict[str, dict]]) -> str:
+    """4개 서브-표를 문자열로 렌더(터미널 출력 + 파일 저장 공용). 행 키 = (config, point)."""
     keys = [(c, p) for c in sorted(all_stats) for p in sorted(all_stats[c])]
-    for title, cols in groups:
+    lines: list[str] = []
+    for title, cols in _TABLE_GROUPS:
         hdr = f"{'config':<8} {'point':<24}" + "".join(f" {n:>{w}}" for n, _, w, _ in cols)
-        print(f"\n── {title} ──")
-        print(hdr)
-        print("-" * len(hdr))
+        lines += [f"\n── {title} ──", hdr, "-" * len(hdr)]
         for c, p in keys:
             s = all_stats[c][p]
             row = f"{c:<8} {p:<24}"
             for _, key, w, prec in cols:
                 row += f" {_fmt(s.get(key), w, prec)}"
-            print(row)
+            lines.append(row)
+    return "\n".join(lines)
+
+
+def write_csv(all_stats: dict[str, dict[str, dict]], path: Path) -> None:
+    """표와 동일 컬럼을 한 줄=한 포인트로 CSV 저장(논문용, RAW 수치 — 반올림/포맷 안 함)."""
+    cols = [("config", None), ("point", None)]
+    for _, group_cols in _TABLE_GROUPS:
+        cols += [(name, key) for name, key, _, _ in group_cols]
+    keys = [(c, p) for c in sorted(all_stats) for p in sorted(all_stats[c])]
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([n for n, _ in cols])
+        for c, p in keys:
+            s = all_stats[c][p]
+            w.writerow([
+                (c if name == "config" else p) if key is None
+                else ("" if s.get(key) is None else s.get(key))
+                for name, key in cols
+            ])
 
 
 def plot_comparison(all_stats: dict[str, dict[str, dict]], out_dir: Path) -> None:
@@ -349,7 +370,17 @@ def main(args: argparse.Namespace) -> None:
         print("No data found.", file=sys.stderr)
         sys.exit(1)
 
-    print_table(all_stats)
+    txt = format_tables(all_stats)
+    print(txt)
+
+    # 터미널뿐 아니라 파일로도 저장 (스크롤로 날아가지 않게 + 논문용 RAW CSV).
+    tag = "_".join(sorted(all_stats))
+    summary_txt = log_dir / f"summary_{tag}.txt"
+    summary_csv = log_dir / f"summary_{tag}.csv"
+    summary_txt.write_text(txt + "\n")
+    write_csv(all_stats, summary_csv)
+    print(f"\n[analyze] 표 저장 → {summary_txt}")
+    print(f"[analyze] CSV 저장 → {summary_csv}")
 
     if args.plot:
         out_dir = log_dir / "plots"
