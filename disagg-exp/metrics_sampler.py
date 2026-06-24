@@ -14,6 +14,7 @@ measured 윈도우 동안 1Hz로 폴링해, result(논문)에 들어갈 per-side
 """
 import asyncio
 import sys
+import time
 from collections import defaultdict
 
 import aiohttp
@@ -48,13 +49,17 @@ class BatchSampler:
         self._ctx0 = None                   # 측정 시작 시점 누적값(baseline) → 완료수를 이 실험 기준 0부터로
         self._gen0 = None
         self._tick = 0
+        self._t_start = None                # 실제 경과시간(t축)용 — tick×interval 대신 monotonic 기준
         self.trace = []                     # 매 tick 스냅샷(라이브 기록) → live_<point>.jsonl로 저장
 
     async def _poll_worker(self, side: str, base_url: str) -> None:
+        # ⚠️ 워커 /metrics(get_iteration_stats)는 내부적으로 get_stats_async(timeout=2)로
+        #   stats 큐를 "최대 2초" 기다렸다 응답(llm.py:585; idle이면 꽉 2초 블록). 클라 타임아웃이
+        #   2초면 레이스로 자주 끊겨 batch가 null이 됨 → 6초로 여유(서버 2초 + 마진).
         try:
             async with self._session.get(
                     f"{base_url}/metrics",
-                    timeout=aiohttp.ClientTimeout(total=2)) as r:
+                    timeout=aiohttp.ClientTimeout(total=6)) as r:
                 if r.status != 200:
                     return
                 data = await r.json()
@@ -97,20 +102,24 @@ class BatchSampler:
             return val - base
         return None
 
+    def _elapsed(self) -> float:
+        return (time.monotonic() - self._t_start) if self._t_start is not None else 0.0
+
     def _print_live(self) -> None:
         bl = self._backlog[-1] if self._backlog else None
-        secs = self._tick * self._interval
+        secs = self._elapsed()
         print(f"  [live +{secs:.0f}s] prefill_done={self._rel(self._last_ctx, self._ctx0)} "
               f"decode_done={self._rel(self._last_gen, self._gen0)} "
               f"backlog={bl} | prefill_batch={self._last_batch('prefill')} decode_batch={self._last_batch('decode')}",
               file=sys.stderr, flush=True)
 
     async def _loop(self) -> None:
+        self._t_start = time.monotonic()          # t축 기준점(실제 경과시간)
         while not self._stop.is_set():
             await asyncio.gather(*[self._poll_worker(s, u) for s, u in self._endpoints])
             await self._poll_backlog()
             self.trace.append({                       # 라이브 기록(매 tick) — timeseries_<point>.jsonl
-                "t": round(self._tick * self._interval, 1),
+                "t": round(self._elapsed(), 1),       # 실제 경과초(폴이 느려도 정확)
                 # 완료수는 이 실험 시작 기준 0부터(누적 아님) — 실험별로 따로 보게.
                 "prefill_done": self._rel(self._last_ctx, self._ctx0),
                 "decode_done": self._rel(self._last_gen, self._gen0),
