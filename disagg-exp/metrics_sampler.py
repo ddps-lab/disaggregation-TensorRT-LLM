@@ -46,6 +46,7 @@ class BatchSampler:
         self._backlog = []                  # (ctx_completed - gen_completed) 샘플 = 쌓인 수
         self._last_ctx = None
         self._last_gen = None
+        self._last_ctx_total = None          # ctx_total_requests_total(=context에 들어온 누적) → prefill 큐 계산용
         self._ctx0 = None                   # 측정 시작 시점 누적값(baseline) → 완료수를 이 실험 기준 0부터로
         self._gen0 = None
         self._tick = 0
@@ -85,11 +86,14 @@ class BatchSampler:
         except Exception:
             return
         ctx, gen = snap.get("ctx"), snap.get("gen")
+        ctx_total = (snap.get("side_keys") or {}).get("ctx_total_requests_total")
         if isinstance(ctx, (int, float)) and isinstance(gen, (int, float)):
             if self._ctx0 is None:          # 첫 유효 샘플 = 이 실험의 baseline(완료수 0 기준점)
                 self._ctx0, self._gen0 = ctx, gen
             self._backlog.append(ctx - gen)  # 차이라 baseline 무관(현재 outstanding)
             self._last_ctx, self._last_gen = ctx, gen
+            if isinstance(ctx_total, (int, float)):
+                self._last_ctx_total = ctx_total
 
     def _last_batch(self, side: str):
         rows = self._samples.get(side) or []
@@ -105,10 +109,18 @@ class BatchSampler:
     def _elapsed(self) -> float:
         return (time.monotonic() - self._t_start) if self._t_start is not None else 0.0
 
+    def _prefill_queue(self):
+        """context에 도착했지만 아직 prefill 안 끝난 수 = ctx_total − ctx_completed (순간값).
+        이게 쌓이면 prefill이 도착을 못 따라가거나 backpressure로 막힌 것."""
+        if isinstance(self._last_ctx_total, (int, float)) and isinstance(self._last_ctx, (int, float)):
+            return self._last_ctx_total - self._last_ctx
+        return None
+
     def _print_live(self) -> None:
         bl = self._backlog[-1] if self._backlog else None
         secs = self._elapsed()
-        print(f"  [live +{secs:.0f}s] prefill_done={self._rel(self._last_ctx, self._ctx0)} "
+        print(f"  [live +{secs:.0f}s] prefill_q={self._prefill_queue()} "
+              f"prefill_done={self._rel(self._last_ctx, self._ctx0)} "
               f"decode_done={self._rel(self._last_gen, self._gen0)} "
               f"backlog={bl} | prefill_batch={self._last_batch('prefill')} decode_batch={self._last_batch('decode')}",
               file=sys.stderr, flush=True)
@@ -123,7 +135,8 @@ class BatchSampler:
                 # 완료수는 이 실험 시작 기준 0부터(누적 아님) — 실험별로 따로 보게.
                 "prefill_done": self._rel(self._last_ctx, self._ctx0),
                 "decode_done": self._rel(self._last_gen, self._gen0),
-                "backlog": (self._backlog[-1] if self._backlog else None),       # prefill끝·decode대기 수
+                "prefill_queue": self._prefill_queue(),                          # context 도착·prefill 대기 수(=ctx_total−ctx_completed)
+                "backlog": (self._backlog[-1] if self._backlog else None),       # prefill끝·decode대기 수(buffer)
                 "prefill_batch": self._last_batch("prefill"),                    # 그 순간 동시 배치수
                 "decode_batch": self._last_batch("decode"),
             })

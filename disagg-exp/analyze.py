@@ -136,15 +136,32 @@ def _timing(side_obj) -> dict:
     return pm.get("timing_metrics") or {}
 
 
+def _agg3(vals: list) -> dict:
+    """list → {mean, p50, p99} (값 없으면 빈 dict)."""
+    xs = [v for v in vals if isinstance(v, (int, float)) and v == v]
+    if not xs:
+        return {}
+    return {"mean": sum(xs) / len(xs), "p50": _p(xs, 50), "p99": _p(xs, 99)}
+
+
+# 한 요청 생애 단계 (perf_metrics 같은 시계). (코드검증: workflow disagg-metrics-audit, 인용 kv_transfer_*.json)
+#   prefill_compute = ctx 첫토큰 − ctx first_scheduled      (순수 prefill 연산)
+#   prefill_queue   = ctx first_scheduled − ctx arrival      (prefill 큐 대기)
+#   kv_transfer     = gen transfer_end − transfer_start      (inter-node KV전송, = "버퍼 대기")
+#   handoff         = gen arrival − ctx 첫토큰               (orchestrator relay)
+#   decode_queue    = gen first_scheduled − gen arrival      (decode 큐 대기 = 보통 지배적!)
+#   decode          = gen 마지막토큰 − gen 첫토큰            (순수 decode, 첫토큰 이후)
+#   ttft_recon      = disagg 첫토큰 − disagg 도착            (재구성 TTFT; 클라 ttft와 교차검증)
+#   e2e             = gen 마지막토큰 − disagg 도착           (요청 전체)
+# ⚠️ 단계 합 ≈ e2e (정확한 분할 아님 — 일부 overlap/생략 segment 있음, glossary 참고).
+_PERF_STAGES = ("prefill_compute", "prefill_queue", "kv_transfer", "handoff",
+                "decode_queue", "decode", "ttft_recon", "e2e")
+
+
 def load_perf_breakdown(config_dir: Path, point_id: str) -> dict:
-    """kv_transfer_{point}.json(/perf_metrics)에서 요청별 지연을 **초 단위, 같은 시계**로 단계분해.
-       (TRT-LLM이 orchestrator steady_clock으로 ctx/gen 타임스탬프를 한 시계에 정렬해 줌.)
-         prefill_s     = ctx 첫토큰 − ctx 도착        (prefill 단계)
-         kv_transfer_s = transfer_end − transfer_start (inter-node KV전송)
-         decode_s      = gen 마지막토큰 − gen 첫토큰    (decode 단계, 첫토큰 이후)
-         e2e_s         = gen 마지막토큰 − disagg 도착   (요청 전체)
-       각 요청값의 p50(중앙값)을 반환(+ kv p99). warmup(8토큰, decode≤1s)은 걸러 측정 요청만 집계.
-       파일 없으면(=perf 비활성) 빈 dict → 표 'n/a'."""
+    """kv_transfer_{point}.json(/perf_metrics)에서 요청별 지연을 단계분해(초, 같은 시계) → 각 단계 mean/p50/p99.
+       warmup(8토큰, decode≤1s)은 걸러 측정 요청만. 파일 없으면 빈 dict.
+       (단계 정의·코드검증은 위 _PERF_STAGES 주석 / workflow audit 참조.)"""
     pf = _raw_dir(config_dir) / f"{F_PERF}_{point_id}.json"
     if not pf.exists():
         return {}
@@ -154,14 +171,9 @@ def load_perf_breakdown(config_dir: Path, point_id: str) -> dict:
         return {}
     if not isinstance(data, list):
         return {}
-    prefill: list[float] = []
-    transfer: list[float] = []
-    decode: list[float] = []
-    e2e: list[float] = []
+    cols: dict = {k: [] for k in _PERF_STAGES}
     reused = missed = 0
-    # warmup은 항상 (prefill 128, decode 8)이라 decode가 ~0.3s. 측정 요청은 dl(≥128)토큰이라 decode가 수초+.
-    # → decode_s > 1초인 레코드(=측정)만 채택해 warmup 오염 제거(smoke처럼 N 작아도 정확).
-    WARMUP_DECODE_MAX_S = 1.0
+    WARMUP_DECODE_MAX_S = 1.0   # warmup(decode 8토큰)≈0.3s → 측정(decode≥수초)만 채택
     for e in data:
         if not isinstance(e, dict):
             continue
@@ -169,35 +181,42 @@ def load_perf_breakdown(config_dir: Path, point_id: str) -> dict:
         gft, glt = gen.get("first_token_time"), gen.get("last_token_time")
         if not (isinstance(gft, (int, float)) and isinstance(glt, (int, float))):
             continue
-        d = glt - gft
-        if d <= WARMUP_DECODE_MAX_S:        # warmup(8토큰) 레코드 → 측정에서 제외
+        if (glt - gft) <= WARMUP_DECODE_MAX_S:   # warmup 제외
             continue
-        decode.append(d)
-        ca, cft = ctx.get("arrival_time"), ctx.get("first_token_time")
-        if isinstance(ca, (int, float)) and isinstance(cft, (int, float)):
-            prefill.append(cft - ca)
+        cols["decode"].append(glt - gft)
+        ca, cfs, cft = ctx.get("arrival_time"), ctx.get("first_scheduled_time"), ctx.get("first_token_time")
+        ga, gfs = gen.get("arrival_time"), gen.get("first_scheduled_time")
         ts, te = gen.get("kv_cache_transfer_start"), gen.get("kv_cache_transfer_end")
-        if isinstance(ts, (int, float)) and isinstance(te, (int, float)):
-            transfer.append(te - ts)
-        da = e.get("disagg_server_arrival_time")
+        da, dft = e.get("disagg_server_arrival_time"), e.get("disagg_server_first_token_time")
+        if isinstance(cft, (int, float)) and isinstance(cfs, (int, float)):
+            cols["prefill_compute"].append(cft - cfs)
+        if isinstance(cfs, (int, float)) and isinstance(ca, (int, float)):
+            cols["prefill_queue"].append(cfs - ca)
+        if isinstance(te, (int, float)) and isinstance(ts, (int, float)):
+            cols["kv_transfer"].append(te - ts)
+        if isinstance(ga, (int, float)) and isinstance(cft, (int, float)):
+            cols["handoff"].append(ga - cft)
+        if isinstance(gfs, (int, float)) and isinstance(ga, (int, float)):
+            cols["decode_queue"].append(gfs - ga)
+        if isinstance(dft, (int, float)) and isinstance(da, (int, float)):
+            cols["ttft_recon"].append(dft - da)
         if isinstance(da, (int, float)):
-            e2e.append(glt - da)
+            cols["e2e"].append(glt - da)
         km = ((e.get("gen_perf_metrics") or {}).get("perf_metrics") or {}).get("kv_cache_metrics") or {}
         reused += km.get("num_reused_blocks", 0)
         missed += km.get("num_missed_blocks", 0)
     out: dict = {}
-    if prefill:
-        out["prefill_s"] = _p(prefill, 50)
-    if transfer:
-        out["kv_transfer_s"] = _p(transfer, 50)
-        out["kv_transfer_p99_s"] = _p(transfer, 99)
-    if decode:
-        out["decode_stage_s"] = _p(decode, 50)
-    if e2e:
-        out["e2e_stage_s"] = _p(e2e, 50)
+    for stage in _PERF_STAGES:
+        for stat, v in _agg3(cols[stage]).items():
+            out[f"{stage}_{stat}_s"] = v
+    # 기존 표/headline 호환 키 (단계 p50을 그대로 매핑)
+    out["prefill_s"] = out.get("prefill_compute_p50_s")
+    out["kv_transfer_s"] = out.get("kv_transfer_p50_s")
+    out["decode_stage_s"] = out.get("decode_p50_s")
+    out["e2e_stage_s"] = out.get("e2e_p50_s")
     if reused + missed:
         out["block_reuse_ratio"] = reused / (reused + missed)
-    return out
+    return {k: v for k, v in out.items() if v is not None}
 
 
 def load_prom(config_dir: Path, point_id: str, mean_pt: float | None, mean_ct: float | None,
@@ -307,6 +326,17 @@ _TABLE_GROUPS = [
         ("decode_time_median_s", "decode_stage_s", 0, 3),
         ("e2e_time_median_s", "e2e_stage_s", 0, 3),
     ]),
+    ("①b 단계분해 상세 (perf_metrics, 초, p50) — TTFT는 보통 decode_queue(=decode 슬롯 대기)가 지배. 단계합≈e2e(정확분할 아님)", [
+        ("prefill_compute_p50_s", "prefill_compute_p50_s", 0, 3),
+        ("prefill_queue_p50_s", "prefill_queue_p50_s", 0, 3),
+        ("kv_transfer_p50_s", "kv_transfer_p50_s", 0, 3),
+        ("handoff_p50_s", "handoff_p50_s", 0, 3),
+        ("decode_queue_p50_s", "decode_queue_p50_s", 0, 3),
+        ("decode_queue_mean_s", "decode_queue_mean_s", 0, 3),
+        ("decode_queue_p99_s", "decode_queue_p99_s", 0, 3),
+        ("decode_p50_s", "decode_p50_s", 0, 3),
+        ("ttft_recon_p50_s", "ttft_recon_p50_s", 0, 3),
+    ]),
     ("② 공식 지연 (benchmark_serving, 클라이언트 측정, 초) — TTFT=첫토큰까지·TPOT=토큰당·E2E=요청끝까지", [
         ("requests_ok", "n_ok", 0, 0), ("fail_pct", "fail_pct", 0, 1),
         ("ttft_median_s", "ttft_p50_s", 0, 3), ("ttft_p99_s", "ttft_p99_s", 0, 3),
@@ -344,6 +374,14 @@ def metric_glossary() -> str:
         "decode_time_median_s          [서버] gen 마지막토큰 − gen 첫토큰 (decode 단계, 첫토큰 이후)",
         "e2e_time_median_s             [서버] gen 마지막토큰 − disagg 도착 (요청 전체) ≈ 위 셋의 합",
         "   ※ warmup(8토큰, decode≤1s) 제외하고 측정 요청만 집계",
+        "[①b 단계 상세 — 한 요청 TTFT가 어디서 대기/소비되나 (perf_metrics 같은 시계)]",
+        "prefill_compute_p50_s   [서버] ctx first_token − first_scheduled (순수 prefill 연산, 작음·일정)",
+        "prefill_queue_p50_s     [서버] ctx first_scheduled − arrival (prefill 큐 대기; 고rate서 폭증=backpressure)",
+        "kv_transfer_p50_s       [서버] = 버퍼 대기 (inter-node KV전송, 작음)",
+        "handoff_p50_s           [서버] gen arrival − ctx first_token (orchestrator relay, 작음)",
+        "decode_queue_p50/mean/p99_s [서버] gen first_scheduled − arrival (decode 슬롯 대기; 보통 TTFT 지배)",
+        "ttft_recon_p50_s        [서버] disagg first_token − arrival (재구성 TTFT; 클라 ttft와 일치로 시계검증)",
+        "   ※ 단계 합 ≈ e2e (overlap 있어 정확 분할 아님). TPOT 재구성 = decode_p50_s / (출력토큰−1).",
         "[② 공식 지연 — benchmark_serving, 클라이언트가 측정한 SLO]",
         "requests_ok / fail_pct        [공식] 완료 요청수 / 실패율(%)",
         "ttft_median_s / ttft_p99_s    [공식] 첫 토큰까지 (median / 99퍼센타일)",
@@ -520,13 +558,20 @@ def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
         ax.legend(fontsize=8)
     ax.set_title("concurrent batch (req)"); ax.set_xlabel("t (s)"); ax.set_ylabel("batch")
 
-    # ② backlog (prefill done, decode pending)
+    # ② queues over time: prefill-side queue (대기) + backlog (prefill done, decode pending)
     ax = axes[1]
+    qx, qy = xy("prefill_queue")                 # ctx_total - ctx_completed (재수집한 run만 존재)
     bx, by = xy("backlog")
+    if qx:
+        ax.plot(qx, qy, marker=".", color="tab:red", label="prefill_queue (arrived, not prefilled)")
     if bx:
-        ax.plot(bx, by, marker=".", color="tab:green", label="backlog (ctx_done - gen_done)")
+        ax.plot(bx, by, marker=".", color="tab:green", label="backlog (prefilled, not decoded)")
+    if qx or bx:
         ax.legend(fontsize=8)
-    ax.set_title("backlog = prefill done, decode pending (req)"); ax.set_xlabel("t (s)"); ax.set_ylabel("req")
+    if not qx:
+        ax.text(0.5, 0.02, "prefill_queue: re-run for this (not in old trace)",
+                ha="center", va="bottom", transform=ax.transAxes, fontsize=7, color="gray")
+    ax.set_title("queues over time (waiting requests)"); ax.set_xlabel("t (s)"); ax.set_ylabel("req")
 
     # ③ cumulative completions
     ax = axes[2]
@@ -603,6 +648,114 @@ def plot_comparison(all_stats: dict[str, dict[str, dict]], out_dir: Path) -> Non
         print(f"  saved {fname}")
 
 
+def plot_latency_decomp(all_stats: dict, out_dir: Path) -> None:
+    """[compare #1] 모든 포인트의 지연 단계분해를 mean/p50/p99 묶음막대로.
+    한 요청 시간이 prefill_compute / prefill_queue / kv_transfer(버퍼대기) / decode_queue(슬롯대기, 보통 지배)
+    / decode / TTFT / TPOT / e2e 어디에 쓰이나. (perf_metrics, warmup 제외.)"""
+    if not HAS_MPLOT:
+        return
+    pts = [(c, p) for c in sorted(all_stats) for p in sorted(all_stats[c])]
+    if not pts:
+        return
+    labels = [p for _, p in pts]
+
+    def series(prefix):
+        return [{k: all_stats[c][p].get(f"{prefix}_{k}_s") for k in ("mean", "p50", "p99")} for c, p in pts]
+
+    def tpot_series():  # decode/(OSL-1)로 파생
+        out = []
+        for c, p in pts:
+            s = all_stats[c][p]
+            try:
+                _, dl, _ = parse_point_id(p)
+            except Exception:
+                dl = None
+            out.append({k: (s.get(f"decode_{k}_s") / (dl - 1)) if (dl and dl > 1 and isinstance(s.get(f"decode_{k}_s"), (int, float))) else None
+                        for k in ("mean", "p50", "p99")})
+        return out
+
+    panels = [
+        ("prefill_compute (s)", series("prefill_compute")),
+        ("prefill_queue wait (s)", series("prefill_queue")),
+        ("kv_transfer = buffer wait (s)", series("kv_transfer")),
+        ("decode_queue wait (s) [usually dominant]", series("decode_queue")),
+        ("decode (s)", series("decode")),
+        ("TTFT (s)", series("ttft_recon")),
+        ("TPOT (s)", tpot_series()),
+        ("e2e (s)", series("e2e")),
+    ]
+    x = np.arange(len(labels))
+    w = 0.27
+    fig, axes = plt.subplots(2, 4, figsize=(22, 9))
+    fig.suptitle("latency decomposition per point — mean / p50 / p99  (perf_metrics, warmup-filtered; stages ~sum to e2e, not exact)")
+    for ax, (title, data) in zip(axes.flat, panels):
+        m = [_num(d.get("mean")) for d in data]
+        p5 = [_num(d.get("p50")) for d in data]
+        p9 = [_num(d.get("p99")) for d in data]
+        ax.bar(x - w, m, w, label="mean")
+        ax.bar(x, p5, w, label="p50")
+        ax.bar(x + w, p9, w, label="p99")
+        ax.set_xticks(x); ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=6)
+        ax.set_title(title, fontsize=9); ax.legend(fontsize=6); ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    fname = out_dir / "compare_latency_decomp.png"
+    fig.savefig(fname, dpi=120); plt.close(fig)
+    print(f"  saved {fname}")
+
+
+def plot_perside_compare(all_stats: dict, out_dir: Path) -> None:
+    """[compare #2] 모든 포인트의 per-side 처리량·동시성: prefill/decode rps, batch(mean+max), backlog(mean+max).
+    1P1D에선 prefill_rps==decode_rps(=orchestrator 집계=단일 워커). batch는 mean_active 막대 + max 수염."""
+    if not HAS_MPLOT:
+        return
+    pts = [(c, p) for c in sorted(all_stats) for p in sorted(all_stats[c])]
+    if not pts:
+        return
+    labels = [p for _, p in pts]
+    x = np.arange(len(labels))
+    g = lambda c, p, k: _num(all_stats[c][p].get(k))
+
+    def whisker(ax, xs, lo, hi):
+        for xi, (a, b) in zip(xs, zip(lo, hi)):
+            if a == a and b == b:
+                ax.plot([xi, xi], [a, b], color="k", linewidth=0.8)
+                ax.plot(xi, b, marker="_", color="k")
+
+    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+    fig.suptitle("per-side throughput & concurrency per point")
+    w = 0.38
+    # A: per-side completed rps
+    ax = axes[0]
+    pf = [g(c, p, "prefill_rps") for c, p in pts]
+    dc = [g(c, p, "decode_rps") for c, p in pts]
+    ax.bar(x - w / 2, pf, w, label="prefill_rps")
+    ax.bar(x + w / 2, dc, w, label="decode_rps")
+    ax.set_title("completed req/s per side  (1P1D: prefill==decode)")
+    # B: concurrent batch (mean bar + max whisker)
+    ax = axes[1]
+    pfb = [g(c, p, "pf_bsz") for c, p in pts]
+    dcb = [g(c, p, "dc_bsz") for c, p in pts]
+    dcbmax = [g(c, p, "dc_bsz_max") for c, p in pts]
+    ax.bar(x - w / 2, pfb, w, label="prefill_batch (mean)")
+    ax.bar(x + w / 2, dcb, w, label="decode_batch (mean)")
+    whisker(ax, x + w / 2, dcb, dcbmax)
+    ax.set_title("concurrent batch  (bar=mean_active, whisker=decode max)")
+    # C: backlog (mean bar + max whisker)
+    ax = axes[2]
+    bl = [g(c, p, "backlog") for c, p in pts]
+    blmax = [g(c, p, "backlog_max") for c, p in pts]
+    ax.bar(x, bl, w, label="backlog (mean)", color="tab:green")
+    whisker(ax, x, bl, blmax)
+    ax.set_title("backlog = prefill done, decode pending  (bar=mean, whisker=max)")
+    for ax in axes:
+        ax.set_xticks(x); ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=7)
+        ax.legend(fontsize=7); ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    fname = out_dir / "compare_perside.png"
+    fig.savefig(fname, dpi=120); plt.close(fig)
+    print(f"  saved {fname}")
+
+
 def main(args: argparse.Namespace) -> None:
     log_dir = Path(args.log_dir)
     configs = args.configs or ["T1", "T2", "T3", "T4"]
@@ -649,6 +802,8 @@ def main(args: argparse.Namespace) -> None:
         comp_dir = (log_dir / next(iter(all_stats)) / "plots") if len(all_stats) == 1 else (log_dir / "plots")
         comp_dir.mkdir(parents=True, exist_ok=True)
         plot_comparison(all_stats, comp_dir)
+        plot_latency_decomp(all_stats, comp_dir)   # compare #1: 지연 단계분해 mean/p50/p99
+        plot_perside_compare(all_stats, comp_dir)  # compare #2: per-side rps·배치·backlog
 
     # 각 config 폴더에 자체완결 REPORT.md(핵심표+지표뜻+안내) + data.csv(전체) → 폴더만 열면 다 봄
     for config in all_stats:
