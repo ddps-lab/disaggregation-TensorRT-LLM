@@ -114,6 +114,7 @@ def load_bench(config_dir: Path, point_id: str) -> dict:
         "out_tok_s":   d.get("output_throughput"),
         "req_s":       d.get("request_throughput"),
         "total_tok_s": d.get("total_token_throughput"),
+        "duration_s":  d.get("duration"),      # main run 실제 부하시간(초) — per-side rps 분모(희석 방지)
         "mean_input_len":  mean_in,
         "mean_output_len": mean_out,
     }
@@ -199,11 +200,15 @@ def load_perf_breakdown(config_dir: Path, point_id: str) -> dict:
     return out
 
 
-def load_prom(config_dir: Path, point_id: str, mean_pt: float | None, mean_ct: float | None) -> dict:
+def load_prom(config_dir: Path, point_id: str, mean_pt: float | None, mean_ct: float | None,
+              bench_duration: float | None = None) -> dict:
     """prom_{point_id}.json (measured-윈도우 전/후 스냅샷)에서 per-side RPS를 계산하고,
     강제된 토큰길이(mean_pt/mean_ct)로 per-side TPS를 파생.
-    - prefill_rps = (ctx_after − ctx_before)/window_s, decode_rps = (gen_after − gen_before)/window_s
+    - prefill_rps = (ctx_after − ctx_before)/T, decode_rps = (gen_after − gen_before)/T
       (ctx_/gen_completed_requests_total — prom_scrape.py 참조)
+    - 분모 T: ⚠️ prom window는 benchmark_serving startup+초기테스트까지 포함해 실제 부하보다 길다(rps 희석,
+      rate↑일수록 심함). 그래서 bench_duration(main run 실측 부하시간)이 있으면 그걸 분모로 → 희석 제거.
+      (count엔 초기테스트 1건이 섞일 수 있으나 N 크면 무시 수준.) 없으면 window_s로 폴백.
     - per-side TPS는 공식 토큰 카운터가 없어(LEARNING_NOTES.md §병렬화·KV전송·per-side 6번) RPS × 토큰수로 파생.
     파일 없으면(=스크레이프 비활성/orchestrator 미노출) 빈 dict → 표에 'n/a'."""
     pf = _raw_dir(config_dir) / f"{F_PROM}_{point_id}.json"
@@ -220,6 +225,9 @@ def load_prom(config_dir: Path, point_id: str, mean_pt: float | None, mean_ct: f
     window_s = snap.get("window_s")
     if not window_s or window_s <= 0:                       # window_s 누락 시 ts로 폴백
         window_s = (after.get("ts") or 0) - (before.get("ts") or 0)
+    # 희석 방지: 실제 부하시간(bench main run)이 있으면 그걸 분모로.
+    if isinstance(bench_duration, (int, float)) and bench_duration > 0:
+        window_s = bench_duration
     if not window_s or window_s <= 0:
         return {}
 
@@ -268,8 +276,13 @@ def load_batch(config_dir: Path, point_id: str) -> dict:
     dc = d.get("decode_batch_mean_active", d.get("decode_batch_mean"))
     if dc is not None:
         out["dc_bsz"] = dc
+    # peak(max)도 노출 — mean은 ramp/idle로 희석되니 천장값(=VRAM·KV풀 한계 신호)을 별도로.
+    if d.get("decode_batch_max") is not None:
+        out["dc_bsz_max"] = d["decode_batch_max"]
     if d.get("decode_kv_used_frac_mean") is not None:
         out["dc_kv_pct"] = d["decode_kv_used_frac_mean"] * 100
+    if d.get("decode_kv_used_frac_max") is not None:
+        out["dc_kv_pct_max"] = d["decode_kv_used_frac_max"] * 100
     # backlog = (ctx_completed − gen_completed)의 윈도우 평균/최대 = "prefill은 끝났는데 decode는
     #   아직 안 끝난 요청 수" = prefill 산출이 decode 앞에 쌓인 양. 관측값만 기록(해석은 사용자).
     if d.get("backlog_mean") is not None:
@@ -309,11 +322,14 @@ _TABLE_GROUPS = [
         ("prefill_tokens_per_sec_approx", "prefill_tps", 0, 0),
         ("decode_tokens_per_sec_approx", "decode_tps", 0, 0),
     ]),
-    ("⑤ prefill vs decode 동시처리·KV·대기 (1Hz 샘플 mean)", [
+    ("⑤ prefill vs decode 동시처리·KV·대기 (1Hz 샘플; mean=평균, max=peak 천장) — mean은 ramp/idle로 희석되니 max도 봄", [
         ("prefill_concurrent_reqs_mean", "pf_bsz", 0, 2),
         ("decode_concurrent_reqs_mean", "dc_bsz", 0, 2),
+        ("decode_concurrent_reqs_max", "dc_bsz_max", 0, 0),
         ("decode_kvpool_used_pct_mean", "dc_kv_pct", 0, 1),
+        ("decode_kvpool_used_pct_max", "dc_kv_pct_max", 0, 1),
         ("backlog_waiting_reqs_mean", "backlog", 0, 1),
+        ("backlog_waiting_reqs_max", "backlog_max", 0, 0),
     ]),
 ]
 
@@ -334,17 +350,18 @@ def metric_glossary() -> str:
         "tpot_median_s                 [공식] 토큰당 시간(첫토큰 제외, median). ※E2E ≈ ttft + tpot×출력토큰수",
         "e2e_client_p99_s              [공식] 요청 끝까지 (99퍼센타일)",
         "output_tokens_per_sec         [공식] 생성토큰 합 / 측정시간",
-        "[③ prefill vs decode 완료 속도·차이 — orchestrator 완료 카운터, 측정창 평균]",
-        "prefill_completed_reqs_per_sec [계산] (측정후−측정전 ctx_completed)/window = prefill이 초당 끝낸 요청수",
-        "decode_completed_reqs_per_sec  [계산] (측정후−측정전 gen_completed)/window = decode가 초당 끝낸 요청수",
+        "[③ prefill vs decode 완료 속도·차이 — orchestrator 완료 카운터 / 실제 부하시간(bench duration)]",
+        "  ※분모=benchmark_serving 'duration'(main run 실측). prom window는 startup·초기테스트 포함해 길어 rps 희석 → 이걸로 보정.",
+        "prefill_completed_reqs_per_sec [계산] (측정후−측정전 ctx_completed)/부하시간 = prefill이 초당 끝낸 요청수",
+        "decode_completed_reqs_per_sec  [계산] (측정후−측정전 gen_completed)/부하시간 = decode가 초당 끝낸 요청수",
         "prefill_minus_decode_per_sec   [계산] 위 둘의 차이 = backlog 쌓이는 속도 (양수=decode가 못 따라감)",
         "prefill_tokens_per_sec_approx  [계산·근사] prefill_completed × 입력길이(ISL). ※토큰 카운터 없어 곱셈 근사",
         "decode_tokens_per_sec_approx   [계산·근사] decode_completed × 출력길이(OSL)",
-        "[④ 동시처리·KV·대기 — 워커 /metrics, 1Hz 샘플 평균(mean)]",
-        "prefill_concurrent_reqs_mean   [서버] prefill 워커가 동시에 처리 중인 요청수(numContextRequests) 평균",
-        "decode_concurrent_reqs_mean    [서버] decode 워커 동시 처리 요청수(numGenRequests) 평균",
-        "decode_kvpool_used_pct_mean    [서버] decode KV풀 사용률(usedNumBlocks/maxNumBlocks×100) 평균",
-        "backlog_waiting_reqs_mean      [계산] (ctx_completed−gen_completed) 평균 = prefill 끝났는데 decode 대기 중인 요청수",
+        "[④ 동시처리·KV·대기 — 워커 /metrics, 1Hz 샘플. mean=평균(ramp/idle 희석), max=peak(천장)]",
+        "prefill_concurrent_reqs_mean   [서버] prefill 워커 동시 처리 요청수(numContextRequests) 평균",
+        "decode_concurrent_reqs_mean/max[서버] decode 워커 동시 처리 요청수(numGenRequests) 평균/최대(=VRAM 천장)",
+        "decode_kvpool_used_pct_mean/max[서버] decode KV풀 사용률(usedNumBlocks/maxNumBlocks×100) 평균/최대",
+        "backlog_waiting_reqs_mean/max  [계산] (ctx_completed−gen_completed) 평균/최대 = decode 대기 중인 요청수(쌓인 양)",
     ])
 
 
@@ -606,7 +623,8 @@ def main(args: argparse.Namespace) -> None:
             mean_ct = b.get("mean_output_len") or dl
             s = dict(b)
             s.update(load_perf_breakdown(config_dir, point_id))             # 지연 단계분해(초): prefill/KV전송/decode/e2e
-            s.update(load_prom(config_dir, point_id, mean_pt, mean_ct))     # per-side RPS/TPS (있으면)
+            s.update(load_prom(config_dir, point_id, mean_pt, mean_ct,
+                               bench_duration=b.get("duration_s")))         # per-side RPS/TPS (분모=실제 부하시간)
             s.update(load_batch(config_dir, point_id))                      # per-side 배치수·KV사용 (있으면)
             # 공식(benchmark_serving) 지연은 ms → 사람이 보는 표는 초(_s)로. (raw json은 ms 그대로)
             for k in list(s):
