@@ -129,9 +129,21 @@ def _warn_pt_delta(point_id: str, bench: dict) -> None:
         print(f"  WARN [{point_id}]: mean input_len {mean_in:.1f} != prefill_len {pl}")
 
 
-def load_perf(config_dir: Path, point_id: str) -> dict:
-    """perf_{point_id}.json (orchestrator /perf_metrics 스냅샷)에서 KV전송시간·블록재사용 통계 추출.
-    파일 없으면(=perf 비활성) 빈 dict → 표에 'n/a'. gen kv_cache_transfer_*는 kv_cache_size>0일 때만 존재."""
+def _timing(side_obj) -> dict:
+    """ctx_/gen_perf_metrics → timing_metrics (perf_metrics 래퍼 유무 둘 다 대응)."""
+    pm = (side_obj or {}).get("perf_metrics") or side_obj or {}
+    return pm.get("timing_metrics") or {}
+
+
+def load_perf_breakdown(config_dir: Path, point_id: str) -> dict:
+    """kv_transfer_{point}.json(/perf_metrics)에서 요청별 지연을 **초 단위, 같은 시계**로 단계분해.
+       (TRT-LLM이 orchestrator steady_clock으로 ctx/gen 타임스탬프를 한 시계에 정렬해 줌.)
+         prefill_s     = ctx 첫토큰 − ctx 도착        (prefill 단계)
+         kv_transfer_s = transfer_end − transfer_start (inter-node KV전송)
+         decode_s      = gen 마지막토큰 − gen 첫토큰    (decode 단계, 첫토큰 이후)
+         e2e_s         = gen 마지막토큰 − disagg 도착   (요청 전체)
+       각 요청값의 p50(중앙값)을 반환(+ kv p99). warmup(8토큰, decode≤1s)은 걸러 측정 요청만 집계.
+       파일 없으면(=perf 비활성) 빈 dict → 표 'n/a'."""
     pf = _raw_dir(config_dir) / f"{F_PERF}_{point_id}.json"
     if not pf.exists():
         return {}
@@ -139,27 +151,49 @@ def load_perf(config_dir: Path, point_id: str) -> dict:
         data = json.loads(pf.read_text())
     except Exception:
         return {}
-    if not isinstance(data, list):   # 비활성/에러 응답(dict/null 등)이면 안전 skip (analyze 전체 크래시 방지)
+    if not isinstance(data, list):
         return {}
-    kv_ms: list[float] = []
+    prefill: list[float] = []
+    transfer: list[float] = []
+    decode: list[float] = []
+    e2e: list[float] = []
     reused = missed = 0
+    # warmup은 항상 (prefill 128, decode 8)이라 decode가 ~0.3s. 측정 요청은 dl(≥128)토큰이라 decode가 수초+.
+    # → decode_s > 1초인 레코드(=측정)만 채택해 warmup 오염 제거(smoke처럼 N 작아도 정확).
+    WARMUP_DECODE_MAX_S = 1.0
     for e in data:
         if not isinstance(e, dict):
             continue
-        gen = e.get("gen_perf_metrics") or {}
-        # 워커 per-request dict는 timing_metrics를 'perf_metrics' 래퍼 아래 중첩할 수 있음(버전차) → 둘 다 대응
-        gen = gen.get("perf_metrics") or gen
-        tm = gen.get("timing_metrics") or {}
-        st, en = tm.get("kv_cache_transfer_start"), tm.get("kv_cache_transfer_end")
-        if st is not None and en is not None:
-            kv_ms.append((en - st) * 1000.0)
-        km = gen.get("kv_cache_metrics") or {}
+        ctx, gen = _timing(e.get("ctx_perf_metrics")), _timing(e.get("gen_perf_metrics"))
+        gft, glt = gen.get("first_token_time"), gen.get("last_token_time")
+        if not (isinstance(gft, (int, float)) and isinstance(glt, (int, float))):
+            continue
+        d = glt - gft
+        if d <= WARMUP_DECODE_MAX_S:        # warmup(8토큰) 레코드 → 측정에서 제외
+            continue
+        decode.append(d)
+        ca, cft = ctx.get("arrival_time"), ctx.get("first_token_time")
+        if isinstance(ca, (int, float)) and isinstance(cft, (int, float)):
+            prefill.append(cft - ca)
+        ts, te = gen.get("kv_cache_transfer_start"), gen.get("kv_cache_transfer_end")
+        if isinstance(ts, (int, float)) and isinstance(te, (int, float)):
+            transfer.append(te - ts)
+        da = e.get("disagg_server_arrival_time")
+        if isinstance(da, (int, float)):
+            e2e.append(glt - da)
+        km = ((e.get("gen_perf_metrics") or {}).get("perf_metrics") or {}).get("kv_cache_metrics") or {}
         reused += km.get("num_reused_blocks", 0)
         missed += km.get("num_missed_blocks", 0)
-    out: dict = {"n_kv": len(kv_ms)}
-    if kv_ms:
-        out["kv_transfer_p50_ms"] = _p(kv_ms, 50)
-        out["kv_transfer_p99_ms"] = _p(kv_ms, 99)
+    out: dict = {}
+    if prefill:
+        out["prefill_s"] = _p(prefill, 50)
+    if transfer:
+        out["kv_transfer_s"] = _p(transfer, 50)
+        out["kv_transfer_p99_s"] = _p(transfer, 99)
+    if decode:
+        out["decode_stage_s"] = _p(decode, 50)
+    if e2e:
+        out["e2e_stage_s"] = _p(e2e, 50)
     if reused + missed:
         out["block_reuse_ratio"] = reused / (reused + missed)
     return out
@@ -249,23 +283,24 @@ def load_batch(config_dir: Path, point_id: str) -> dict:
 
 # 표/CSV 공통 컬럼 스펙: (표시이름, stats키, 너비, 소수자리). 카테고리별 4개 서브-표.
 _TABLE_GROUPS = [
-    ("① 지연 latency  (TTFT=첫토큰까지, TPOT=토큰당, E2EL=요청끝까지; 전부 ms)", [
+    ("① 지연 단계분해 (초, perf_metrics — 한 요청 시간이 어디서 쓰이나; e2e≈prefill+kv전송+decode)", [
+        ("prefill_s", "prefill_s", 10, 3), ("kv_transfer_s", "kv_transfer_s", 14, 3),
+        ("decode_s", "decode_stage_s", 10, 3), ("e2e_s", "e2e_stage_s", 9, 3),
+    ]),
+    ("② 지연 공식측정 (초, benchmark_serving — 클라이언트 SLO. TTFT=첫토큰·TPOT=토큰당·E2EL=요청끝)", [
         ("n_ok", "n_ok", 5, 0), ("fail%", "fail_pct", 6, 1),
-        ("ttft_p50(ms)", "ttft_p50_ms", 13, 1), ("ttft_p99(ms)", "ttft_p99_ms", 13, 1),
-        ("tpot_p50(ms)", "tpot_p50_ms", 13, 2), ("tpot_p99(ms)", "tpot_p99_ms", 13, 2),
-        ("itl_p99(ms)", "itl_p99_ms", 12, 2), ("e2el_p99(ms)", "e2el_p99_ms", 13, 1),
+        ("ttft_p50_s", "ttft_p50_s", 11, 3), ("ttft_p99_s", "ttft_p99_s", 11, 3),
+        ("tpot_p50_s", "tpot_p50_s", 11, 3), ("e2el_p99_s", "e2el_p99_s", 11, 2),
     ]),
-    ("② 처리량 throughput + KV전송시간", [
+    ("③ 처리량 throughput", [
         ("out_tok/s", "out_tok_s", 10, 1),
-        ("kv_p50(ms)", "kv_transfer_p50_ms", 11, 2), ("kv_p99(ms)", "kv_transfer_p99_ms", 11, 2),
     ]),
-    ("③ per-side 완료율·토큰 (prefill vs decode) — [계산]", [
+    ("④ per-side 완료율·토큰 (prefill vs decode) — [계산]", [
         ("prefill_rps", "prefill_rps", 11, 2), ("decode_rps", "decode_rps", 11, 2),
         ("prefill_tok/s", "prefill_tps", 13, 0), ("decode_tok/s", "decode_tps", 13, 0),
     ]),
-    ("④ per-side 배치·KV·backlog (batch=동시처리 평균, busy%=바쁜시간, backlog=쌓인수)", [
+    ("⑤ per-side 배치·KV·backlog (batch=동시처리수, backlog=대기수)", [
         ("prefill_batch", "pf_bsz", 13, 2), ("decode_batch", "dc_bsz", 13, 2),
-        ("prefill_busy%", "pf_act", 13, 1), ("decode_busy%", "dc_act", 13, 1),
         ("decode_kv%", "dc_kv_pct", 10, 1), ("backlog", "backlog", 8, 1),
     ]),
 ]
@@ -274,21 +309,28 @@ _TABLE_GROUPS = [
 def metric_glossary() -> str:
     """각 지표 = 어디서 왔나. [공식]=benchmark_serving, [서버]=워커/orchestrator raw, [계산]=우리 코드 식."""
     return "\n".join([
-        "── 지표 출처·식  ([공식]=benchmark_serving / [서버]=raw 노출값 / [계산]=우리 코드) ──",
+        "── 지표 출처·식  ([공식]=benchmark_serving / [서버]=perf_metrics·/metrics / [계산]=우리 코드).  시간=초 ──",
+        "[단계분해 — perf_metrics, 한 요청 시간을 단계로 쪼갬, 요청별 중앙값(p50)]",
+        "prefill_s        [서버] ctx 첫토큰 − ctx 도착  (prefill 단계)",
+        "kv_transfer_s    [서버] kv_cache_transfer_end − start  (inter-node KV전송 단계)",
+        "decode_s         [서버] gen 마지막토큰 − gen 첫토큰  (decode 단계, 첫토큰 이후)",
+        "e2e_s            [서버] gen 마지막토큰 − disagg 도착  (요청 전체) ≈ prefill + kv_transfer + decode",
+        "   ※ warmup(8토큰, decode≤1s)은 걸러 측정 요청만 집계",
+        "[공식측정 — benchmark_serving, 클라이언트 SLO]",
         "n_ok, fail%      [공식] 완료 요청수 / 실패율(%)",
-        "ttft,tpot,itl,e2el  [공식] per-request 측정 분포의 p50/p99 (ms). 우리 계산 아님",
+        "ttft_p50/99_s    [공식] 첫 토큰까지(prefill+전송+첫decode 다 포함)",
+        "tpot_p50_s       [공식] 토큰당 시간(첫토큰 제외).  ※E2E ≈ ttft + tpot×출력토큰수",
+        "e2el_p99_s       [공식] 요청 끝까지(클라이언트 측정)",
         "out_tok/s        [공식] 생성토큰 합 / 측정시간",
-        "kv_p50, kv_p99   [서버] /perf_metrics 의 (kv_cache_transfer_end - start)×1000 [ms] 분포 p50/p99",
-        "prefill_rps      [계산] (측정후 - 측정전, ctx_completed_requests_total) / window_s",
-        "decode_rps       [계산] (측정후 - 측정전, gen_completed_requests_total) / window_s",
-        "prefill_tok/s    [계산·근사] prefill_rps × 입력길이(ISL).  ※토큰 카운터가 없어 곱셈 근사",
-        "decode_tok/s     [계산·근사] decode_rps  × 출력길이(OSL).  ※동상",
-        "prefill_batch    [서버] 워커 /metrics inflightBatchingStats.numContextRequests, 1Hz 샘플 평균(idle 0 제외)",
-        "decode_batch     [서버] 워커 /metrics inflightBatchingStats.numGenRequests,    1Hz 샘플 평균(idle 0 제외)",
-        "prefill_busy%    [계산] prefill_batch>0 인 샘플 비율 × 100 (= 바쁜 시간 비율)",
-        "decode_busy%     [계산] decode_batch>0 인 샘플 비율 × 100",
-        "decode_kv%       [서버] 워커 /metrics kvCacheStats.usedNumBlocks / maxNumBlocks × 100, 1Hz 평균",
-        "backlog          [계산] (ctx_completed - gen_completed) 1Hz 평균 = 'prefill 끝났는데 decode 아직 안 끝난 요청수'",
+        "[per-side — 측정 윈도우/워커]",
+        "prefill_rps      [계산] (측정후 − 측정전, ctx_completed_requests_total) / window_s",
+        "decode_rps       [계산] (측정후 − 측정전, gen_completed_requests_total) / window_s",
+        "prefill_tok/s    [계산·근사] prefill_rps × 입력길이(ISL).  ※토큰 카운터 없어 곱셈 근사",
+        "decode_tok/s     [계산·근사] decode_rps  × 출력길이(OSL)",
+        "prefill_batch    [서버] 워커 /metrics numContextRequests, 1Hz 샘플 평균(처리중일 때)",
+        "decode_batch     [서버] 워커 /metrics numGenRequests,    1Hz 샘플 평균(처리중일 때)",
+        "decode_kv%       [서버] 워커 /metrics usedNumBlocks / maxNumBlocks × 100, 1Hz 평균",
+        "backlog          [계산] (ctx_completed − gen_completed) 1Hz 평균 = 'prefill 끝났는데 decode 대기 중인 요청수'",
     ])
 
 
@@ -327,10 +369,11 @@ def write_csv(all_stats: dict[str, dict[str, dict]], path: Path) -> None:
 
 
 # REPORT.md 핵심표 = 꼭 보는 지표만(나머지 전부는 data.csv). (표시명, stats키, 소수자리)
+# 단계분해(초) 중심 — 한 요청 시간이 prefill/KV전송/decode 어디에 쓰이나 + 처리량·decode배치·backlog.
 _HEADLINE = [
-    ("TTFT_p50(ms)", "ttft_p50_ms", 1), ("TPOT_p50(ms)", "tpot_p50_ms", 1),
+    ("prefill_s", "prefill_s", 3), ("kv_transfer_s", "kv_transfer_s", 3),
+    ("decode_s", "decode_stage_s", 3), ("e2e_s", "e2e_stage_s", 3),
     ("out_tok/s", "out_tok_s", 1),
-    ("prefill_rps", "prefill_rps", 2), ("decode_rps", "decode_rps", 2),
     ("decode_batch", "dc_bsz", 1), ("backlog", "backlog", 1), ("decode_kv%", "dc_kv_pct", 1),
 ]
 
@@ -381,7 +424,7 @@ def write_report(config: str, config_dir: Path, stats_one: dict) -> None:
         f"- 토폴로지: {topo}  ·  배치: {meta.get('placement','?')}-node  ·  KV전송: {meta.get('cache_transceiver_backend','?')}",
         "- 부하: 공식 benchmark_serving (open-loop, Poisson). point = p{prefill}_d{decode}_r{rate}", "",
         "## 핵심 결과", _headline_md(stats_one), "",
-        "> 전체 메트릭(p99·ITL·E2EL·tok/s·busy% 등) = `data.csv` · 시간순 그림 = `plots/timeseries_*.png` · rate별 = `plots/grid_compare_*.png`", "",
+        "> 핵심표는 단계분해(초)·처리량·decode배치·backlog. 공식 TTFT/TPOT/E2EL·per-side rps·전체 수치 = `data.csv` · 시간순 = `plots/timeseries_*.png` · rate별 = `plots/grid_compare_*.png`", "",
         "## 지표 뜻 / 출처·식", "```", metric_glossary(), "```", "",
         "## 이 폴더 안내", "```", _file_index(), "```",
     ]
@@ -493,8 +536,8 @@ def plot_comparison(all_stats: dict[str, dict[str, dict]], out_dir: Path) -> Non
         for config, rate_stats in sorted(config_data.items()):
             rate_stats.sort(key=lambda x: x[0])
             rates  = [x[0] for x in rate_stats]
-            ttft50 = [_num(x[1].get("ttft_p50_ms")) for x in rate_stats]
-            ttft99 = [_num(x[1].get("ttft_p99_ms")) for x in rate_stats]
+            ttft50 = [_num(x[1].get("ttft_p50_s")) for x in rate_stats]
+            ttft99 = [_num(x[1].get("ttft_p99_s")) for x in rate_stats]
             thr     = [_num(x[1].get("out_tok_s")) for x in rate_stats]
             pf_rps  = [_num(x[1].get("prefill_rps")) for x in rate_stats]
             dc_rps  = [_num(x[1].get("decode_rps")) for x in rate_stats]
@@ -511,7 +554,7 @@ def plot_comparison(all_stats: dict[str, dict[str, dict]], out_dir: Path) -> Non
             axes[3].plot(rates, dc_bsz, marker="s", linestyle="--", label=f"{config} dc_bsz")
             axes[3].plot(rates, backlog, marker="^", linestyle=":", label=f"{config} backlog")
 
-        axes[0].set_title("TTFT (ms)");        axes[0].set_xlabel("rate (req/s)"); axes[0].legend(fontsize=7)
+        axes[0].set_title("TTFT (s)");         axes[0].set_xlabel("rate (req/s)"); axes[0].legend(fontsize=7)
         axes[1].set_title("per-side completion rps (prefill vs decode)"); axes[1].set_xlabel("rate (req/s)"); axes[1].legend(fontsize=7)
         axes[2].set_title("output throughput (tok/s)"); axes[2].set_xlabel("rate (req/s)"); axes[2].legend(fontsize=7)
         axes[3].set_title("batch & backlog (req)"); axes[3].set_xlabel("rate (req/s)"); axes[3].legend(fontsize=7)
@@ -542,9 +585,13 @@ def main(args: argparse.Namespace) -> None:
             mean_pt = b.get("mean_input_len") or pl     # --save-detailed 없으면 목표 길이로 폴백
             mean_ct = b.get("mean_output_len") or dl
             s = dict(b)
-            s.update(load_perf(config_dir, point_id))                       # KV전송시간 (있으면)
+            s.update(load_perf_breakdown(config_dir, point_id))             # 지연 단계분해(초): prefill/KV전송/decode/e2e
             s.update(load_prom(config_dir, point_id, mean_pt, mean_ct))     # per-side RPS/TPS (있으면)
             s.update(load_batch(config_dir, point_id))                      # per-side 배치수·KV사용 (있으면)
+            # 공식(benchmark_serving) 지연은 ms → 사람이 보는 표는 초(_s)로. (raw json은 ms 그대로)
+            for k in list(s):
+                if k.endswith("_ms") and isinstance(s[k], (int, float)):
+                    s[k[:-3] + "_s"] = s[k] / 1000.0
             all_stats[config][point_id] = s
 
     if not all_stats:
