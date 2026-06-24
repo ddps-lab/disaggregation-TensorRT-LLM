@@ -476,7 +476,7 @@ async def main(args: argparse.Namespace) -> None:
 
     done = 0
     skipped = 0
-    for prefill_len, decode_len, rate in points:
+    for idx, (prefill_len, decode_len, rate) in enumerate(points, 1):
         point_id = f"p{prefill_len}_d{decode_len}_r{rate}"  # 파일명 = 실험 조건
         bench_file = f"{F_BENCH}_{point_id}.json"            # benchmark_serving --save-result 결과
         marker_done   = out_dir / f".done_{point_id}"        # 완료 도장 (재실행 시 스킵)
@@ -485,9 +485,15 @@ async def main(args: argparse.Namespace) -> None:
         # 이미 완료된 조건은 건너뜀 → 중간에 끊겨도 이어서 실행 가능
         if marker_done.exists():
             skipped += 1
+            print(f"[{idx}/{len(points)}] {point_id} — SKIP (이미 완료)", flush=True)
             continue
 
-        print(f"[{done+1}/{len(points)}] prefill={prefill_len} decode={decode_len} rate={rate} ...", flush=True)
+        # ── 실험 config 배너 (다음 포인트로 넘어갈 때마다 무엇을 도는지 명확히) ──
+        print("\n" + "=" * 72, flush=True)
+        print(f"[{idx}/{len(points)}] config={config}   point={point_id}", flush=True)
+        print(f"    prefill(ISL)={prefill_len}  decode(OSL)={decode_len}  rate={rate} req/s"
+              f"   (warmup={WARMUP_N}, measured={MEASURED_N}, placement={os.environ.get('PLACEMENT','intra')})", flush=True)
+        print("=" * 72, flush=True)
 
         try:
             ok = await run_point(base_url, config, prefill_len, decode_len, rate,
