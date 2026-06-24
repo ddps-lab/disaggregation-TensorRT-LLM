@@ -110,6 +110,8 @@ def load_bench(config_dir: Path, point_id: str) -> dict:
         "tpot_p50_ms": d.get("p50_tpot_ms"),
         "tpot_p99_ms": d.get("p99_tpot_ms"),
         "itl_p99_ms":  d.get("p99_itl_ms"),
+        "e2el_mean_ms": d.get("mean_e2el_ms"),   # 공식 client 요청 e2e 평균(paper용)
+        "e2el_p50_ms": d.get("p50_e2el_ms"),
         "e2el_p99_ms": d.get("p99_e2el_ms"),
         "out_tok_s":   d.get("output_throughput"),
         "req_s":       d.get("request_throughput"),
@@ -682,12 +684,13 @@ def plot_latency_decomp(all_stats: dict, out_dir: Path) -> None:
         ("decode (s)", series("decode")),
         ("TTFT (s)", series("ttft_recon")),
         ("TPOT (s)", tpot_series()),
-        ("e2e (s)", series("e2e")),
+        ("e2e = Σ stages (s) [perf_metrics recon]", series("e2e")),
+        ("e2e request time (s) [official client E2EL]", series("e2el")),
     ]
     x = np.arange(len(labels))
     w = 0.27
-    fig, axes = plt.subplots(2, 4, figsize=(22, 9))
-    fig.suptitle("latency decomposition per point — mean / p50 / p99  (perf_metrics, warmup-filtered; stages ~sum to e2e, not exact)")
+    fig, axes = plt.subplots(3, 3, figsize=(20, 12))
+    fig.suptitle("latency decomposition per point — mean / p50 / p99  (perf_metrics, warmup-filtered; recon e2e ≈ official E2EL ⇒ split is trustworthy)")
     for ax, (title, data) in zip(axes.flat, panels):
         m = [_num(d.get("mean")) for d in data]
         p5 = [_num(d.get("p50")) for d in data]
