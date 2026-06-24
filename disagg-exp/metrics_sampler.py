@@ -46,6 +46,7 @@ class BatchSampler:
         self._last_ctx = None
         self._last_gen = None
         self._tick = 0
+        self.trace = []                     # 매 tick 스냅샷(라이브 기록) → live_<point>.jsonl로 저장
 
     async def _poll_worker(self, side: str, base_url: str) -> None:
         try:
@@ -96,6 +97,12 @@ class BatchSampler:
         while not self._stop.is_set():
             await asyncio.gather(*[self._poll_worker(s, u) for s, u in self._endpoints])
             await self._poll_backlog()
+            self.trace.append({                       # 라이브 기록(매 tick) — 나중에 live_<point>.jsonl
+                "t": round(self._tick * self._interval, 1),
+                "ctx_done": self._last_ctx, "gen_done": self._last_gen,
+                "backlog": (self._backlog[-1] if self._backlog else None),
+                "pf_bsz": self._last_batch("prefill"), "dc_bsz": self._last_batch("decode"),
+            })
             if self._live and self._tick % self._live_every == 0:
                 self._print_live()
             self._tick += 1
@@ -122,8 +129,11 @@ class BatchSampler:
                      and isinstance(r["maxb"], (int, float)) and r["maxb"]]
             out[f"{side}_n_samples"] = len(rows)
             if batches:
-                out[f"{side}_batch_mean"] = sum(batches) / len(batches)
+                active = [b for b in batches if b > 0]   # idle(0) 제외 — 먼저 끝난 쪽이 0으로 평균 깎는 것 방지
+                out[f"{side}_batch_mean"] = sum(batches) / len(batches)            # 전체(idle 포함) = 점유율
+                out[f"{side}_batch_mean_active"] = (sum(active) / len(active)) if active else 0.0  # 처리 중일 때만
                 out[f"{side}_batch_max"] = max(batches)
+                out[f"{side}_active_frac"] = len(active) / len(batches)            # 바쁜 시간 비율(0~1)
             if fracs:
                 out[f"{side}_kv_used_frac_mean"] = sum(fracs) / len(fracs)
                 out[f"{side}_kv_used_frac_max"] = max(fracs)

@@ -187,6 +187,7 @@ async def run_point(
     out_dir: Path,
     prom_out: Path | None = None,
     batch_out: Path | None = None,
+    live_out: Path | None = None,
 ) -> bool:
     """공식 benchmark_serving로 warmup→measured 실행. measured 결과 = out_dir/result_filename.
     prom_out 지정 시 measured 윈도우 전/후로 per-side 카운터 스냅샷(warmup 제외 = 변인통제).
@@ -202,6 +203,7 @@ async def run_point(
     # ── 2단계: measured (공식 측정) — per-side 카운터로 윈도우 bracket + 배치수 샘플링 ──
     before_prom = after_prom = None   # async with 밖에서 읽으므로 미리 None
     batch_stats = None
+    live_trace = None
     async with aiohttp.ClientSession() as session:
         if prom_out is not None:
             before_prom = await prom_scrape.snapshot(session, base_url)
@@ -216,6 +218,7 @@ async def run_point(
         rc = await run_bench(measured_args)
         if sampler is not None:
             batch_stats = await sampler.stop()   # 폴링 종료 + per-side 평균/최대 집계
+            live_trace = sampler.trace            # 매초 스냅샷(라이브 기록)
         if prom_out is not None:
             after_prom = await prom_scrape.snapshot(session, base_url)
 
@@ -227,6 +230,10 @@ async def run_point(
     if batch_out is not None and batch_stats:
         with open(batch_out, "w") as f:
             json.dump(batch_stats, f, indent=2)
+    if live_out is not None and live_trace:
+        with open(live_out, "w") as f:   # jsonl: 한 줄 = 한 tick 스냅샷(라이브 기록)
+            for row in live_trace:
+                f.write(json.dumps(row) + "\n")
 
     # 성공판정: benchmark_serving 종료코드 0 + result.json 생성
     result_path = out_dir / result_filename
@@ -473,7 +480,8 @@ async def main(args: argparse.Namespace) -> None:
             ok = await run_point(base_url, config, prefill_len, decode_len, rate,
                                  result_filename=bench_file, out_dir=out_dir,
                                  prom_out=out_dir / f"prom_{point_id}.json",
-                                 batch_out=out_dir / f"batch_{point_id}.json")
+                                 batch_out=out_dir / f"batch_{point_id}.json",
+                                 live_out=out_dir / f"live_{point_id}.jsonl")
         except Exception as exc:
             print(f"  ERROR: {exc}", flush=True)
             marker_failed.touch()

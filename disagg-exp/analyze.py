@@ -205,10 +205,14 @@ def load_batch(config_dir: Path, point_id: str) -> dict:
     except Exception:
         return {}
     out: dict = {}
-    if d.get("prefill_batch_mean") is not None:
-        out["pf_bsz"] = d["prefill_batch_mean"]
-    if d.get("decode_batch_mean") is not None:
-        out["dc_bsz"] = d["decode_batch_mean"]
+    # pf_bsz/dc_bsz = "처리 중일 때"의 평균 배치수(idle 0 제외) — 먼저 끝난 쪽이 0으로 평균 깎는 것 방지.
+    #   (전체평균 prefill_batch_mean·바쁜비율 *_active_frac·최대 *_batch_max 는 batch_<point>.json에 그대로 있음)
+    pf = d.get("prefill_batch_mean_active", d.get("prefill_batch_mean"))
+    if pf is not None:
+        out["pf_bsz"] = pf
+    dc = d.get("decode_batch_mean_active", d.get("decode_batch_mean"))
+    if dc is not None:
+        out["dc_bsz"] = dc
     if d.get("decode_kv_used_frac_mean") is not None:
         out["dc_kv_pct"] = d["decode_kv_used_frac_mean"] * 100
     # backlog = (ctx_completed − gen_completed)의 윈도우 평균/최대 = "prefill은 끝났는데 decode는
