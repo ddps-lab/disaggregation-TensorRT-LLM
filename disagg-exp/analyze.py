@@ -211,6 +211,12 @@ def load_batch(config_dir: Path, point_id: str) -> dict:
         out["dc_bsz"] = d["decode_batch_mean"]
     if d.get("decode_kv_used_frac_mean") is not None:
         out["dc_kv_pct"] = d["decode_kv_used_frac_mean"] * 100
+    # backlog = (ctx_completed − gen_completed)의 윈도우 평균/최대 = "prefill은 끝났는데 decode는
+    #   아직 안 끝난 요청 수" = prefill 산출이 decode 앞에 쌓인 양. 관측값만 기록(해석은 사용자).
+    if d.get("backlog_mean") is not None:
+        out["backlog"] = d["backlog_mean"]
+    if d.get("backlog_max") is not None:
+        out["backlog_max"] = d["backlog_max"]
     return out
 
 
@@ -220,7 +226,7 @@ def print_table(all_stats: dict[str, dict[str, dict]]) -> None:
         f" {'ttft_p50':>9} {'ttft_p99':>9} {'tpot_p50':>9} {'tpot_p99':>9}"
         f" {'itl_p99':>8} {'e2el_p99':>9} {'out_tok/s':>10}"
         f" {'kv_p50':>8} {'kv_p99':>8} {'pf_rps':>7} {'dc_rps':>7} {'pf_tps':>8} {'dc_tps':>8}"
-        f" {'pf_bsz':>7} {'dc_bsz':>7} {'dc_kv%':>7}"
+        f" {'pf_bsz':>7} {'dc_bsz':>7} {'dc_kv%':>7} {'backlog':>8}"
     )
     print(header)
     print("-" * len(header))
@@ -242,12 +248,13 @@ def print_table(all_stats: dict[str, dict[str, dict]]) -> None:
                 f" {_fmt(s.get('kv_transfer_p50_ms'),8,2)} {_fmt(s.get('kv_transfer_p99_ms'),8,2)}"
                 f" {_fmt(s.get('prefill_rps'),7,2)} {_fmt(s.get('decode_rps'),7,2)}"
                 f" {_fmt(s.get('prefill_tps'),8,0)} {_fmt(s.get('decode_tps'),8,0)}"
-                f" {_fmt(s.get('pf_bsz'),7,2)} {_fmt(s.get('dc_bsz'),7,2)} {_fmt(s.get('dc_kv_pct'),7,1)}"
+                f" {_fmt(s.get('pf_bsz'),7,2)} {_fmt(s.get('dc_bsz'),7,2)} {_fmt(s.get('dc_kv_pct'),7,1)} {_fmt(s.get('backlog'),8,1)}"
             )
 
 
 def plot_comparison(all_stats: dict[str, dict[str, dict]], out_dir: Path) -> None:
-    """One plot per (prefill_len, decode_len) pair: TTFT/TPOT/throughput vs rate for all configs."""
+    """One plot per (prefill_len, decode_len) pair, 4 panels vs rate, all configs:
+    TTFT / per-side 완료 rps(prefill vs decode) / output throughput / batch & backlog."""
     if not HAS_MPLOT:
         print("matplotlib not available, skipping plots")
         return
@@ -270,22 +277,26 @@ def plot_comparison(all_stats: dict[str, dict[str, dict]], out_dir: Path) -> Non
             rates  = [x[0] for x in rate_stats]
             ttft50 = [_num(x[1].get("ttft_p50_ms")) for x in rate_stats]
             ttft99 = [_num(x[1].get("ttft_p99_ms")) for x in rate_stats]
-            tpot50 = [_num(x[1].get("tpot_p50_ms")) for x in rate_stats]
-            thr    = [_num(x[1].get("out_tok_s")) for x in rate_stats]
-            pf_bsz = [_num(x[1].get("pf_bsz")) for x in rate_stats]
-            dc_bsz = [_num(x[1].get("dc_bsz")) for x in rate_stats]
+            thr     = [_num(x[1].get("out_tok_s")) for x in rate_stats]
+            pf_rps  = [_num(x[1].get("prefill_rps")) for x in rate_stats]
+            dc_rps  = [_num(x[1].get("decode_rps")) for x in rate_stats]
+            pf_bsz  = [_num(x[1].get("pf_bsz")) for x in rate_stats]
+            dc_bsz  = [_num(x[1].get("dc_bsz")) for x in rate_stats]
+            backlog = [_num(x[1].get("backlog")) for x in rate_stats]
 
             axes[0].plot(rates, ttft50, marker="o", label=f"{config} p50")
             axes[0].plot(rates, ttft99, marker="x", linestyle="--", label=f"{config} p99")
-            axes[1].plot(rates, tpot50, marker="o", label=config)
+            axes[1].plot(rates, pf_rps, marker="o", label=f"{config} prefill")
+            axes[1].plot(rates, dc_rps, marker="s", linestyle="--", label=f"{config} decode")
             axes[2].plot(rates, thr, marker="o", label=config)
-            axes[3].plot(rates, pf_bsz, marker="o", label=f"{config} prefill")
-            axes[3].plot(rates, dc_bsz, marker="s", linestyle="--", label=f"{config} decode")
+            axes[3].plot(rates, pf_bsz, marker="o", label=f"{config} pf_bsz")
+            axes[3].plot(rates, dc_bsz, marker="s", linestyle="--", label=f"{config} dc_bsz")
+            axes[3].plot(rates, backlog, marker="^", linestyle=":", label=f"{config} backlog")
 
         axes[0].set_title("TTFT (ms)");        axes[0].set_xlabel("rate (req/s)"); axes[0].legend(fontsize=7)
-        axes[1].set_title("TPOT p50 (ms/tok)"); axes[1].set_xlabel("rate (req/s)"); axes[1].legend(fontsize=7)
+        axes[1].set_title("per-side 완료 rps (prefill vs decode)"); axes[1].set_xlabel("rate (req/s)"); axes[1].legend(fontsize=7)
         axes[2].set_title("output throughput (tok/s)"); axes[2].set_xlabel("rate (req/s)"); axes[2].legend(fontsize=7)
-        axes[3].set_title("batch (in-flight req)"); axes[3].set_xlabel("rate (req/s)"); axes[3].legend(fontsize=7)
+        axes[3].set_title("batch & backlog (req)"); axes[3].set_xlabel("rate (req/s)"); axes[3].legend(fontsize=7)
 
         fig.tight_layout()
         fname = out_dir / f"plot_p{pl}_d{dl}.png"

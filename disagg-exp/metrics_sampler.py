@@ -1,44 +1,53 @@
-"""metrics_sampler.py — per-side(prefill/decode) 배치수·KV사용 기록 (공식 미제공 → 커스텀).
+"""metrics_sampler.py — per-side(prefill/decode) 라이브 상태 + backlog 기록 (공식 미제공 → 커스텀).
 
-orchestrator(:8000)는 per-side "지금 돌고 있는 요청수(배치수)"를 집계해 주지 않는다.
-그 값은 각 워커의 GET /metrics (iteration stats)에만 라이브로 노출되므로, measured 윈도우
-동안 워커 /metrics를 주기 폴링해 prefill/decode 배치수와 KV 사용량의 평균/최대를 낸다.
+measured 윈도우 동안 1Hz로 폴링해, result(논문)에 들어갈 per-side 동역학을 그대로 기록한다.
+추천/비율 판단은 하지 않는다 — 관측값만 충실히 남기고 해석은 사용자가 한다.
+  - prefill/decode 동시 배치수 : 각 워커 /metrics inflightBatchingStats.numContext/numGenRequests
+  - decode KV풀 사용률          : 워커 /metrics kvCacheStats.used/maxNumBlocks
+  - backlog(쌓인 요청수)        : orchestrator /prometheus/metrics 의 ctx_completed − gen_completed
+       = "prefill은 끝났는데 decode는 아직 안 끝난 요청 수" (openai_client.py:266-267 _finish_request에서
+         ctx/gen 클라이언트가 각자 완료 때 .inc; perf_metrics.py:93-99 role 접두 ctx/gen).
+또한 SWEEP_LIVE면 진행 중 per-side 상태를 stderr로 주기 출력(상태줄).
 
-스키마는 v1.2.1 소스로 검증함 (tests/unittest/llmapi/apps/_test_openai_metrics.py:54-101):
-  - /metrics 는 stat 객체 "리스트"(최근 iteration들)를 반환
-  - stat["inflightBatchingStats"]["numContextRequests"]  # prefill(context) 배치
-  - stat["inflightBatchingStats"]["numGenRequests"]       # decode(generation) 배치
-  - stat["kvCacheStats"]["usedNumBlocks"] / ["maxNumBlocks"] / ["tokensPerBlock"]
-camelCase. PyTorch 백엔드도 동일 스키마(같은 IterationStats 직렬화).
-
-⚠️ inter-node에선 gen 워커가 원격 노드라, sweep 명령에 CTX_URLS/GEN_URLS를 줘서
-   원격 워커 /metrics 주소를 알려줘야 한다(orchestrator엔 iteration stats 없음).
+스키마 검증(v1.2.1): tests/unittest/llmapi/apps/_test_openai_metrics.py:54-101
+  (inflightBatchingStats / kvCacheStats, camelCase, /metrics = stat 리스트). PyTorch 백엔드 동일.
 """
 import asyncio
+import sys
 from collections import defaultdict
 
 import aiohttp
+
+import prom_scrape   # orchestrator ctx/gen 완료 카운터 스냅샷 재사용
 
 # side → 그 워커의 "현재 배치수"를 나타내는 inflightBatchingStats 필드
 _BATCH_FIELD = {"prefill": "numContextRequests", "decode": "numGenRequests"}
 
 
 class BatchSampler:
-    """measured 윈도우 동안 워커 /metrics를 interval초마다 폴링해 per-side 배치수·KV사용 누적.
+    """measured 윈도우 동안 워커 /metrics + orchestrator 카운터를 주기 폴링.
 
     endpoints: [(side, base_url)], side ∈ {"prefill","decode"}, base_url 예 "http://172.31.50.92:8011"
+    orchestrator_url: backlog(ctx-gen)용 orchestrator base_url (예 "http://localhost:8000")
     """
 
-    def __init__(self, session: aiohttp.ClientSession,
-                 endpoints, interval: float = 1.0):
+    def __init__(self, session: aiohttp.ClientSession, endpoints, interval: float = 1.0,
+                 orchestrator_url=None, live: bool = True, live_every: int = 5):
         self._session = session
         self._endpoints = list(endpoints)
         self._interval = interval
+        self._orch = orchestrator_url
+        self._live = live
+        self._live_every = max(1, live_every)
         self._stop = asyncio.Event()
         self._task = None
-        self._samples = defaultdict(list)   # side → [{"batch":int, "used":int, "maxb":int}]
+        self._samples = defaultdict(list)   # side → [{batch, used, maxb}]
+        self._backlog = []                  # (ctx_completed - gen_completed) 샘플 = 쌓인 수
+        self._last_ctx = None
+        self._last_gen = None
+        self._tick = 0
 
-    async def _poll_one(self, side: str, base_url: str) -> None:
+    async def _poll_worker(self, side: str, base_url: str) -> None:
         try:
             async with self._session.get(
                     f"{base_url}/metrics",
@@ -60,9 +69,36 @@ class BatchSampler:
                 "maxb": kvs.get("maxNumBlocks"),
             })
 
+    async def _poll_backlog(self) -> None:
+        if not self._orch:
+            return
+        try:
+            snap = await prom_scrape.snapshot(self._session, self._orch)
+        except Exception:
+            return
+        ctx, gen = snap.get("ctx"), snap.get("gen")
+        if isinstance(ctx, (int, float)) and isinstance(gen, (int, float)):
+            self._backlog.append(ctx - gen)
+            self._last_ctx, self._last_gen = ctx, gen
+
+    def _last_batch(self, side: str):
+        rows = self._samples.get(side) or []
+        return rows[-1]["batch"] if rows else None
+
+    def _print_live(self) -> None:
+        bl = self._backlog[-1] if self._backlog else None
+        secs = self._tick * self._interval
+        print(f"  [live +{secs:.0f}s] ctx_done={self._last_ctx} gen_done={self._last_gen} "
+              f"backlog={bl} | pf_bsz={self._last_batch('prefill')} dc_bsz={self._last_batch('decode')}",
+              file=sys.stderr, flush=True)
+
     async def _loop(self) -> None:
         while not self._stop.is_set():
-            await asyncio.gather(*[self._poll_one(s, u) for s, u in self._endpoints])
+            await asyncio.gather(*[self._poll_worker(s, u) for s, u in self._endpoints])
+            await self._poll_backlog()
+            if self._live and self._tick % self._live_every == 0:
+                self._print_live()
+            self._tick += 1
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval)
             except asyncio.TimeoutError:
@@ -91,4 +127,8 @@ class BatchSampler:
             if fracs:
                 out[f"{side}_kv_used_frac_mean"] = sum(fracs) / len(fracs)
                 out[f"{side}_kv_used_frac_max"] = max(fracs)
+        if self._backlog:
+            out["backlog_mean"] = sum(self._backlog) / len(self._backlog)
+            out["backlog_max"] = max(self._backlog)
+            out["backlog_n_samples"] = len(self._backlog)
         return out

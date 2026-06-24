@@ -59,6 +59,7 @@ def _worker_metrics_endpoints():
     return eps
 
 WORKER_METRICS_EPS = _worker_metrics_endpoints()
+LIVE = os.environ.get("SWEEP_LIVE", "1") == "1"   # measured 중 per-side 라이브 상태줄(stderr) 출력
 
 # ── grid (실험 조건표) ────────────────────────────────────────────────────────
 # 환경변수로 오버라이드 가능하며, (prefill,decode)×rate 교차곱이 전체 Grid를 구성합니다.
@@ -207,7 +208,8 @@ async def run_point(
         # per-side 배치수·KV 샘플러: measured 동안만 워커 /metrics 폴링 (warmup 제외=변인통제)
         sampler = None
         if batch_out is not None and WORKER_METRICS_EPS:
-            sampler = metrics_sampler.BatchSampler(session, WORKER_METRICS_EPS, interval=1.0)
+            sampler = metrics_sampler.BatchSampler(session, WORKER_METRICS_EPS, interval=1.0,
+                                                   orchestrator_url=base_url, live=LIVE)
             sampler.start()
         measured_args = build_bench_args(base_url, prefill_len, decode_len, rate,
                                          MEASURED_N, out_dir, result_filename, streaming=True)
