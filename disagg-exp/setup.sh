@@ -36,7 +36,9 @@ $PY -m pip install -q matplotlib 2>/dev/null || true   # analyze.py --plot용(�
 # ifstat: NIC 대역폭 1Hz 기록 (Prefill→Decode KV전송 바이트 관측 — inter-node 핵심)
 if ! command -v ifstat &>/dev/null; then
     echo "[setup] installing ifstat ..."
-    $SUDO apt-get install -y -q ifstat 2>/dev/null || echo "[setup] WARN: apt install ifstat 실패"
+    # ⚠️ apt-get update 먼저 — 핀 컨테이너는 apt 패키지목록이 비어 있어, update 없이 install하면 ifstat을 못 찾아 실패함.
+    $SUDO apt-get update -qq 2>/dev/null || true
+    $SUDO apt-get install -y -q ifstat 2>/dev/null || echo "[setup] WARN: apt install ifstat 실패 (apt-get update 후에도 실패 — NIC 메트릭만 부재, 핵심 측정엔 무관)"
 fi
 
 # s5cmd: 초고속 S3 백업 (aws s3 sync 폴백 있음)
