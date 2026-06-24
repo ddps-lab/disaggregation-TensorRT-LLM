@@ -326,10 +326,11 @@ def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
         ys = [r.get(key) for r in rows if r.get(key) is not None]
         return xs, ys
 
+    # 라벨은 영어로 (컨테이너 matplotlib에 한글 폰트 없어 □ 깨짐 + 논문용 적합).
     fig, axes = plt.subplots(1, 3, figsize=(16, 4))
-    fig.suptitle(f"{config}  {point_id}  (시간순 — t=측정시작 후 초)")
+    fig.suptitle(f"{config}  {point_id}  (time-series, t = s since measure start)")
 
-    # ① 동시 배치수
+    # ① concurrent batch
     ax = axes[0]
     pf_x, pf_y = xy("pf_bsz")
     dc_x, dc_y = xy("dc_bsz")
@@ -338,26 +339,31 @@ def plot_timeseries(config: str, point_id: str, config_dir: Path) -> None:
     if dc_x:
         ax.plot(dc_x, dc_y, marker=".", label="decode batch")
     if not pf_x and not dc_x:
-        ax.text(0.5, 0.5, "batch n/a\n(enable_iter_perf_stats:true 후 재측정)",
+        ax.text(0.5, 0.5, "batch n/a\n(set enable_iter_perf_stats, re-measure)",
                 ha="center", va="center", transform=ax.transAxes, fontsize=9)
-    ax.set_title("동시 배치수 (req)"); ax.set_xlabel("t (s)"); ax.set_ylabel("batch"); ax.legend(fontsize=8)
+    else:
+        ax.legend(fontsize=8)
+    ax.set_title("concurrent batch (req)"); ax.set_xlabel("t (s)"); ax.set_ylabel("batch")
 
-    # ② backlog (prefill 큐에 쌓인 수)
+    # ② backlog (prefill done, decode pending)
     ax = axes[1]
     bx, by = xy("backlog")
     if bx:
-        ax.plot(bx, by, marker=".", color="tab:green", label="backlog (ctx_done−gen_done)")
-    ax.set_title("backlog = prefill끝·decode대기 (req)"); ax.set_xlabel("t (s)"); ax.set_ylabel("req"); ax.legend(fontsize=8)
+        ax.plot(bx, by, marker=".", color="tab:green", label="backlog (ctx_done - gen_done)")
+        ax.legend(fontsize=8)
+    ax.set_title("backlog = prefill done, decode pending (req)"); ax.set_xlabel("t (s)"); ax.set_ylabel("req")
 
-    # ③ 누적 완료수
+    # ③ cumulative completions
     ax = axes[2]
     cx, cy = xy("ctx_done")
     gx, gy = xy("gen_done")
     if cx:
-        ax.plot(cx, cy, marker=".", label="ctx_done (prefill 누적)")
+        ax.plot(cx, cy, marker=".", label="ctx_done (prefill, cumulative)")
     if gx:
-        ax.plot(gx, gy, marker=".", linestyle="--", label="gen_done (decode 누적)")
-    ax.set_title("누적 완료수 (기울기=처리율)"); ax.set_xlabel("t (s)"); ax.set_ylabel("requests"); ax.legend(fontsize=8)
+        ax.plot(gx, gy, marker=".", linestyle="--", label="gen_done (decode, cumulative)")
+    if cx or gx:
+        ax.legend(fontsize=8)
+    ax.set_title("cumulative completions (slope = rps)"); ax.set_xlabel("t (s)"); ax.set_ylabel("requests")
 
     fig.tight_layout()
     fname = config_dir / f"{F_LIVE}_{point_id}.png"
@@ -409,7 +415,7 @@ def plot_comparison(all_stats: dict[str, dict[str, dict]], out_dir: Path) -> Non
             axes[3].plot(rates, backlog, marker="^", linestyle=":", label=f"{config} backlog")
 
         axes[0].set_title("TTFT (ms)");        axes[0].set_xlabel("rate (req/s)"); axes[0].legend(fontsize=7)
-        axes[1].set_title("per-side 완료 rps (prefill vs decode)"); axes[1].set_xlabel("rate (req/s)"); axes[1].legend(fontsize=7)
+        axes[1].set_title("per-side completion rps (prefill vs decode)"); axes[1].set_xlabel("rate (req/s)"); axes[1].legend(fontsize=7)
         axes[2].set_title("output throughput (tok/s)"); axes[2].set_xlabel("rate (req/s)"); axes[2].legend(fontsize=7)
         axes[3].set_title("batch & backlog (req)"); axes[3].set_xlabel("rate (req/s)"); axes[3].legend(fontsize=7)
 
