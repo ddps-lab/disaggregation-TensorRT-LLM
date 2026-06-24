@@ -16,6 +16,7 @@
 | **`prom_scrape.py`** | per-side 스크레이퍼. orchestrator `/prometheus/metrics`의 `ctx_/gen_completed_requests_total`를 스냅샷 → prefill/decode RPS. | 🆕 **신규** (공식이 per-side를 안 줌 — 유일한 커스텀 메트릭). |
 | **`analyze.py`** | `bench_<point>.json`(공식 집계 TTFT/TPOT/ITL/E2EL/throughput) + `prom_*`(per-side) + `perf_*`(KV) → 표·플롯·$per-Mtok. | 🔄 **공식 result.json 읽기로 전환**(우리 계산 제거). `COST_PER_HR`(g5/g6/g6e), config T1~T4. |
 | **`setup.sh`** | 노드 부트스트랩. 측정 수집기(nvidia-smi dmon·ifstat·DCGM·chrony)·s5cmd 기동, 버전 검증. | 🔄 **계승(수집기 그대로)** + 🆕 **설치부 교체**: vLLM/LMCache/venv 빌드 → **NGC 컨테이너 모델**(tensorrt_llm 사전설치 확인). |
+| **`sync_telemetry.sh`** | **sweep를 안 돌리는 노드(=decode node2)** 의 results/(nvidia-smi·ifstat·dcgm)를 S3로 백그라운드 백업. 경로 스키마는 `sweep.py`의 S3Syncer와 동일(같은 날짜/config, 다른 hostname). | 🆕 **신규** (S3Syncer는 sweep 노드에서만 돌아 node2 텔레메트리가 안 올라가던 갭을 메움). |
 | **`launch_trtllm.sh`** | 서버 기동기. config+role(context/generation/proxy)별로 `trtllm-serve`를 띄우고 disagg config YAML을 런타임 생성. | 🆕 **신규** (vLLM의 `launch_configs.sh`를 대체). 골격(role 분기·env·포트규약)만 계승, 내부는 전면 교체. |
 | **`ctx_extra_llm_api_options.yaml`** | **context(prefill) 워커**의 변인통제 (bf16·TRTLLM attn·block_reuse off·chunked off·cuda_graph off·overlap off). | 🆕 **신규**. vLLM에선 CLI 플래그(`--no-enable-prefix-caching` 등)였던 걸 TRT-LLM은 이 YAML로. |
 | **`gen_extra_llm_api_options.yaml`** | **generation(decode) 워커**의 변인통제 (cuda_graph on·overlap on). | 🆕 **신규**. (동상) |
@@ -114,8 +115,9 @@ hostname -I | awk '{print $1}'             # 각 노드 사설IP 확보 (orchest
 **1. 노드 D (decode) 먼저**
 ```bash
 export UCX_TLS=tcp,cuda_copy,sm,self       # cross-node = TCP 강제(EFA 없음). 안 주면 UCX 실패 가능
+CONFIG=smoke bash sync_telemetry.sh start  # node2 telemetry(nvidia-smi·ifstat·dcgm)→S3 백그라운드. node1은 sweep가 자동, node2는 sweep를 안 돌려 이게 필요. (CONFIG=node1 --config 와 동일하게)
 LABEL=smoke NUM_GEN=1 GEN_TP=1 GEN_PP=1 GEN_GPU_BASE=0 LOG_LEVEL=debug \
-  bash launch_trtllm.sh generation         # :8011
+  bash launch_trtllm.sh generation         # :8011 (포그라운드 — sync는 위에서 백그라운드로 이미 떴음)
 ```
 **2. 노드 P (context 워커 + orchestrator)**
 ```bash
@@ -295,7 +297,7 @@ results/
 ├── disagg_<LABEL>.yaml                        # 런타임 생성된 orchestrator config
 ├── nvidia_smi.csv      ifstat.csv   dcgm.log  # 1Hz/2s 시스템 메트릭 (setup.sh 수집기)
 ├── clock_baseline_<host>.txt  s3_sync.log
-├── .pid_nvidia_dmon  .pid_ifstat  .pid_dcgm_loop
+├── .pid_nvidia_dmon  .pid_ifstat  .pid_dcgm_loop  .pid_telemetry_sync  # 마지막=node2 sync_telemetry.sh
 └── <config>/                                  # 예: T1/, smoke/
     ├── bench_p{pl}_d{dl}_r{rate}.json         # 공식 benchmark_serving 결과 (TTFT/TPOT/ITL/E2EL/throughput)
     ├── prom_p{pl}_d{dl}_r{rate}.json          # per-side 카운터 스냅샷 (prefill/decode RPS)
