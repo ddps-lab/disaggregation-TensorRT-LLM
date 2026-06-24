@@ -249,15 +249,15 @@ def load_batch(config_dir: Path, point_id: str) -> dict:
 
 # 표/CSV 공통 컬럼 스펙: (표시이름, stats키, 너비, 소수자리). 카테고리별 4개 서브-표.
 _TABLE_GROUPS = [
-    ("① 지연 latency (ms)", [
+    ("① 지연 latency  (TTFT=첫토큰까지, TPOT=토큰당, E2EL=요청끝까지; 전부 ms)", [
         ("n_ok", "n_ok", 5, 0), ("fail%", "fail_pct", 6, 1),
-        ("ttft_p50", "ttft_p50_ms", 9, 1), ("ttft_p99", "ttft_p99_ms", 9, 1),
-        ("tpot_p50", "tpot_p50_ms", 9, 2), ("tpot_p99", "tpot_p99_ms", 9, 2),
-        ("itl_p99", "itl_p99_ms", 8, 2), ("e2el_p99", "e2el_p99_ms", 9, 1),
+        ("ttft_p50(ms)", "ttft_p50_ms", 13, 1), ("ttft_p99(ms)", "ttft_p99_ms", 13, 1),
+        ("tpot_p50(ms)", "tpot_p50_ms", 13, 2), ("tpot_p99(ms)", "tpot_p99_ms", 13, 2),
+        ("itl_p99(ms)", "itl_p99_ms", 12, 2), ("e2el_p99(ms)", "e2el_p99_ms", 13, 1),
     ]),
-    ("② 처리량 throughput + KV전송(ms)", [
+    ("② 처리량 throughput + KV전송시간", [
         ("out_tok/s", "out_tok_s", 10, 1),
-        ("kv_p50", "kv_transfer_p50_ms", 8, 2), ("kv_p99", "kv_transfer_p99_ms", 8, 2),
+        ("kv_p50(ms)", "kv_transfer_p50_ms", 11, 2), ("kv_p99(ms)", "kv_transfer_p99_ms", 11, 2),
     ]),
     ("③ per-side 완료율·토큰 (prefill vs decode) — [계산]", [
         ("prefill_rps", "prefill_rps", 11, 2), ("decode_rps", "decode_rps", 11, 2),
