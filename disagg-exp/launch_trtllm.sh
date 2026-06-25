@@ -29,7 +29,7 @@ CTX_EXTRA="${CTX_EXTRA:-$SCRIPT_DIR/ctx_extra_llm_api_options.yaml}"   # context
 GEN_EXTRA="${GEN_EXTRA:-$SCRIPT_DIR/gen_extra_llm_api_options.yaml}"   # generation 워커 변인통제 YAML
 SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-1800}"   # orchestrator -t (초). 대형모델 안전
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-1800}"             # orchestrator -r (초)
-LOGS_DIR="$LOG_DIR/logs"   # 서버 stdout/stderr 로그·생성 disagg yaml은 여기로 (results 루트 정리)
+LOGS_DIR="$LOG_DIR/$LABEL/logs"   # per-config 번들 안에 보존: results/<LABEL>/logs/ (워커 로그가 결과와 함께 sync·commit → 크래시 스택 회수). LABEL은 sweep --config와 일치시킬 것(line 26)
 mkdir -p "$LOG_DIR" "$LOGS_DIR"
 
 export PYTHONHASHSEED="${PYTHONHASHSEED:-123}"

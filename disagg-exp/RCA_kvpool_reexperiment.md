@@ -35,7 +35,7 @@
 따로 뽑는 스크립트 필요 없음. 그냥 그 로그를 읽으면 된다.
 
 **준비(설정 한 줄, 코드 아님):** 기동 전 로그레벨만 올린다 → 스택/주변 맥락이 자세해짐.
-워커 로그는 `launch_trtllm.sh`가 이미 `$LOG_DIR/logs/trtllm_*_{ctx,gen}_*.log`로 자동 저장.
+워커 로그는 `launch_trtllm.sh`가 `results/<LABEL>/logs/trtllm_<LABEL>_{context,generation}_p<port>_<host>.log`로 자동 저장(per-config 번들 안 → S3 sync·git commit으로 회수). gen 워커 로그 1개가 sweep 전체(모든 grid point)에 걸쳐 누적되다 크래시 시점까지 담는다.
 
 **터지면 gen 로그에서 이 줄을 찾는다:** `Can't allocate new blocks. No free blocks left.`
 **바로 뒤 스택의 발생 라인이 = 진짜 메커니즘:**
