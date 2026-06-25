@@ -719,12 +719,13 @@ def plot_latency_decomp(all_stats: dict, out_dir: Path) -> None:
 
 
 def plot_perside_compare(all_stats: dict, out_dir: Path) -> None:
-    """[compare #2] 포인트별 per-side 동역학, 4패널:
-      ① 완료율(req/s, 원래 정의=orchestrator 카운터/시간) — 1P1D라 양측 동일(conservation)
-      ② 동시배치  ③ transfer-pool backlog
-      ④ per-side 이용률(%): prefill 컴퓨트 busy%(=100×rps×prefill_compute) vs decode KV풀 점유 max%.
-         prefill 놀고(낮음) decode~100%면 decode 병목 → D 늘려라. 빨강 = 균형 1P:N·D.
-    ※완료율이 같은 건 버그 아님 — 모든 요청이 prefill→decode 거쳐 같은 수 완료. 비대칭은 ④ 이용률에서 보임."""
+    """[compare #2] 포인트별 per-side 동역학, 5패널:
+      ① 완료율(req/s) — 1P1D라 양측 동일(conservation)
+      ② 토큰 처리량(tok/s, 공식 벤치): prefill 입력=request_throughput×ISL, decode 출력=output_throughput
+      ③ 동시배치  ④ transfer-pool backlog
+      ⑤ per-side 이용률(%): prefill 컴퓨트 busy%(=100×rps×prefill_compute) vs decode KV풀 점유 max%.
+         prefill 놀고 decode~100%면 decode 병목 → D 늘려라. 빨강 = 균형 1P:N·D.
+    ※완료율 같은 건 버그 아님(conservation). 토큰비는 ISL:OSL(2:1), 비대칭은 ⑤ 이용률에서 보임."""
     if not HAS_MPLOT:
         return
     pts = [(c, p) for c in sorted(all_stats) for p in sorted(all_stats[c])]
@@ -740,18 +741,25 @@ def plot_perside_compare(all_stats: dict, out_dir: Path) -> None:
                 ax.plot([xi, xi], [a, b], color="k", linewidth=0.8)
                 ax.plot(xi, b, marker="_", color="k")
 
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4.6))
+    fig, axes = plt.subplots(1, 5, figsize=(20, 4.6))
     fig.suptitle("Per-side dynamics per point")
     w = 0.38
-    # A: per-side completion rate (original def: orchestrator counters / duration). 1P1D라 양측 동일.
+    # A: per-side completion rate (req/s, 공식 벤치 request rate). 1P1D라 양측 동일.
     ax = axes[0]
     pf = [g(c, p, "prefill_rps") for c, p in pts]
     dc = [g(c, p, "decode_rps") for c, p in pts]
     ax.bar(x - w / 2, pf, w, label="prefill completion rate")
     ax.bar(x + w / 2, dc, w, label="decode completion rate")
     ax.set_title("Completion rate (req/s) — equal (1P1D conservation)", fontsize=9)
-    # B: concurrent batch (mean bar + max whisker)
+    # B: per-side token throughput (공식 벤치): prefill 입력tok/s = req_throughput×ISL, decode 출력tok/s = output_throughput
     ax = axes[1]
+    p_tps = [g(c, p, "prefill_input_tps_official") for c, p in pts]
+    d_tps = [g(c, p, "decode_output_tps_official") for c, p in pts]
+    ax.bar(x - w / 2, p_tps, w, label="prefill: input tok/s")
+    ax.bar(x + w / 2, d_tps, w, label="decode: output tok/s")
+    ax.set_title("Token throughput (tok/s, official bench)", fontsize=9)
+    # C: concurrent batch (mean bar + max whisker)
+    ax = axes[2]
     pfb = [g(c, p, "pf_bsz") for c, p in pts]
     dcb = [g(c, p, "dc_bsz") for c, p in pts]
     dcbmax = [g(c, p, "dc_bsz_max") for c, p in pts]
@@ -759,15 +767,15 @@ def plot_perside_compare(all_stats: dict, out_dir: Path) -> None:
     ax.bar(x + w / 2, dcb, w, label="decode batch (mean)")
     whisker(ax, x + w / 2, dcb, dcbmax)
     ax.set_title("Concurrent batch (mean bar, decode-max whisker)", fontsize=9)
-    # C: backlog (mean bar + max whisker)
-    ax = axes[2]
+    # D: backlog (mean bar + max whisker)
+    ax = axes[3]
     bl = [g(c, p, "backlog") for c, p in pts]
     blmax = [g(c, p, "backlog_max") for c, p in pts]
     ax.bar(x, bl, w, label="backlog (mean)", color="tab:green")
     whisker(ax, x, bl, blmax)
     ax.set_title("Transfer-pool backlog (mean bar, max whisker)", fontsize=9)
-    # D: per-side UTILIZATION (각 측이 자기 용량의 몇 % 쓰나) → 병목·노드비율. red = balanced 1P : N·D
-    ax = axes[3]
+    # E: per-side UTILIZATION (각 측이 자기 용량의 몇 % 쓰나) → 병목·노드비율. red = balanced 1P : N·D
+    ax = axes[4]
     p_u = [g(c, p, "prefill_compute_util_pct") for c, p in pts]
     d_u = [g(c, p, "decode_kv_util_pct") for c, p in pts]
     ax.bar(x - w / 2, p_u, w, label="prefill: compute busy %")
@@ -802,6 +810,17 @@ def _derive_capacity(s: dict, point_id: str) -> None:
     rps = s.get("decode_rps")                               # 달성 완료율(원래 정의, 양측 동일)
     if not isinstance(rps, (int, float)):
         rps = s.get("decode_done_rps")
+    # 공식 벤치 기반 per-side tps: prefill 입력tok/s = 공식 request_throughput × ISL, decode 출력tok/s = 공식 output_throughput
+    isl = s.get("mean_input_len")
+    if not isinstance(isl, (int, float)):
+        try:
+            isl, _, _ = parse_point_id(point_id)
+        except Exception:
+            isl = None
+    if isinstance(s.get("req_s"), (int, float)) and isinstance(isl, (int, float)):
+        s["prefill_input_tps_official"] = s["req_s"] * isl
+    if isinstance(s.get("out_tok_s"), (int, float)):
+        s["decode_output_tps_official"] = s["out_tok_s"]
     if isinstance(pc, (int, float)) and pc > 0:
         s["prefill_capacity_reqs_per_sec"] = 1.0 / pc
         if isinstance(rps, (int, float)):
