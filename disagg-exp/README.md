@@ -290,17 +290,17 @@ python analyze.py --configs smoke
 ### 로그 구조 (어디에 뭐가 있나) — `$EXP_LOG_DIR/` (기본 `./results`)
 
 ```
-results/                                       # 루트는 3종류만: logs/ · telemetry/ · <config>/
-├── logs/                                      # 서버 stdout/stderr + 생성 config (launch_trtllm.sh)
-│   ├── trtllm_<LABEL>_context_p8001_<host>.log
-│   ├── trtllm_<LABEL>_generation_p8011_<host>.log
-│   ├── trtllm_<LABEL>_proxy_<host>.log
-│   └── disagg_<LABEL>.yaml                     #   런타임 생성된 orchestrator config
+results/                                       # 루트: telemetry/ · <config>/ (서버 로그는 <config>/logs/ 안)
 ├── telemetry/                                 # 노드 인프라 메트릭 (setup.sh 수집기 + s3 sync)
 │   ├── nvidia_smi.csv  ifstat.csv  dcgm.log    #   1Hz/2s GPU·NIC·DCGM
 │   ├── clock_baseline_<host>.txt  s3_sync.log
 │   └── .pid_nvidia_dmon  .pid_ifstat  .pid_dcgm_loop  .pid_telemetry_sync
 └── <config>/                                  # 예: T1/, smoke/   (point = p{prefill}_d{decode}_r{rate})
+    ├── logs/                                  # ★ 서버 stdout/stderr + 생성 config (per-config 번들 안 → 결과와 함께 sync·commit, 크래시 스택 회수)
+    │   ├── trtllm_<LABEL>_context_p8001_<host>.log
+    │   ├── trtllm_<LABEL>_generation_p8011_<host>.log   #   gen 1개가 sweep 전체 누적 → 크래시 assert+스택 여기
+    │   ├── trtllm_<LABEL>_proxy_<host>.log
+    │   └── disagg_<LABEL>.yaml                #   런타임 생성된 orchestrator config
     │   ── 사람이 보는 것 (폴더 열면 이것부터) ──
     ├── REPORT.md                              # ★ 이것만 봐도 됨: 핵심표 + 지표 출처·식 + 폴더안내
     ├── data.csv                               # 전체 메트릭 RAW 수치(논문용, analyze가 생성)
