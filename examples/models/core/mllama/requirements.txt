@@ -1,2 +1,2 @@
 nvidia-modelopt[torch]~=0.21.0
-transformers==4.48.3
+transformers==5.5.0
